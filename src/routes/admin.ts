@@ -32,10 +32,16 @@ type FileRow = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const SECOND_MS = 1000;
 
 function remainingRetentionDays(row: VersionRow, durationDays: number): number {
   const expiresAt = Date.parse(row.registered_at) + durationDays * DAY_MS;
   return Math.max(0, Math.ceil((expiresAt - Date.now()) / DAY_MS));
+}
+
+function remainingRetentionSeconds(row: VersionRow, durationDays: number): number {
+  const remaining = (Date.parse(row.registered_at) + durationDays * DAY_MS - Date.now()) / SECOND_MS;
+  return remaining < 0 ? Math.floor(remaining) : Math.ceil(remaining);
 }
 
 async function loadPolicies(env: AppEnv["Bindings"]): Promise<PolicyRow[]> {
@@ -128,6 +134,7 @@ async function versionSummary(
     protectedByKeepLatest,
     retentionState: isPersistent ? "persistent" : `${retentionDays} days`,
     retentionRemainingDays: isPersistent ? null : remainingRetentionDays(row, retentionDays),
+    retentionRemainingSeconds: isPersistent ? null : remainingRetentionSeconds(row, retentionDays),
   };
   if (includeFiles) result.files = files;
   return result;

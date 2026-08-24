@@ -111,7 +111,10 @@ describe("Admin console page", () => {
     expect(html).toContain('aria-pressed="true"');
     expect(html).toContain("let groupByTags = true");
     expect(html).toContain("function tagGroupLabel(tags)");
-    expect(html).toContain('const formatDaysLeft = (value) => value + (value === 1 ? " day left" : " days left");');
+    expect(html).toContain('hourCycle: "h23"');
+    expect(html).toContain("const formatRetentionRemaining = (value)");
+    expect(html).toContain('return "Expired"');
+    expect(html).toContain('className = remainingSeconds < 0 ? "expired" : ""');
     expect(html).toContain("No tags");
     expect(html).not.toContain('id="guide"');
     expect(html).toContain('id="publishing"');
@@ -357,6 +360,7 @@ describe("Nix cache HTTP API", () => {
       { versionName: "recent-1", registeredAt: new Date(now - 3 * 60 * 60 * 1000).toISOString() },
       { versionName: "recent-2", registeredAt: new Date(now - 2 * 60 * 60 * 1000).toISOString() },
       { versionName: "recent-3", registeredAt: new Date(now - 60 * 60 * 1000).toISOString() },
+      { versionName: "expired", registeredAt: new Date(now - 4 * 24 * 60 * 60 * 1000).toISOString() },
     ];
     for (const version of versions) {
       await testEnv.DB.prepare(
@@ -365,11 +369,15 @@ describe("Nix cache HTTP API", () => {
     }
     const response = await request(`/api/admin/packages/${packageName}`, { headers: bearer("admin-secret") });
     expect(response.response.status).toBe(200);
-    const body = await response.response.json<{ versions: Array<{ versionName: string; retentionState: string; retentionRemainingDays: number | null; protectedByKeepLatest: boolean }> }>();
+    const body = await response.response.json<{ versions: Array<{ versionName: string; retentionState: string; retentionRemainingDays: number | null; retentionRemainingSeconds: number | null; protectedByKeepLatest: boolean }> }>();
     const aging = body.versions.find((version) => version.versionName === "aging");
     const protectedVersion = body.versions.find((version) => version.versionName === "recent-3");
+    const expired = body.versions.find((version) => version.versionName === "expired");
     expect(aging).toMatchObject({ retentionState: "3 days", retentionRemainingDays: 2 });
+    expect(aging?.retentionRemainingSeconds).toBeGreaterThan(129500);
+    expect(aging?.retentionRemainingSeconds).toBeLessThan(129700);
     expect(protectedVersion).toMatchObject({ protectedByKeepLatest: true, retentionState: "persistent", retentionRemainingDays: null });
+    expect(expired?.retentionRemainingSeconds).toBeLessThan(0);
   });
 
   it("exposes package, version, and file hierarchy and targets version operations", async () => {
