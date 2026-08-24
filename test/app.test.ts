@@ -117,6 +117,7 @@ describe("Admin console page", () => {
     expect(html).toContain('className = remainingSeconds < 0 ? "expired" : ""');
     expect(html).toContain("waitForJob(jobId)");
     expect(html).toContain('result.reused ? "GC already scheduled · " : "GC started · "');
+    expect(html).toContain('setMessage("GC scan completed · queued deletions may continue", "success")');
     expect(html).toContain("No tags");
     expect(html).not.toContain('id="guide"');
     expect(html).toContain('id="publishing"');

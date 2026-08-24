@@ -40,9 +40,12 @@ without waiting for Cron; larger work remains queued for the next drain or
 Cron trigger.
 
 The admin page polls `/api/admin/jobs/:jobId` for a short bounded period after a
-manual request. It refreshes the package table when the job completes and
-reports a still-running or failed job without hiding the asynchronous nature
-of large GC runs.
+manual request. The returned job represents the bounded GC scan; the scan may
+already be completed while deletion child jobs remain queued. The console
+refreshes the package table when the scan completes and says that queued
+deletions may continue, so it does not imply that every eligible version has
+already been deleted. It reports a still-running or failed job without hiding
+the asynchronous nature of large GC runs.
 
 ## Invariants and security
 
@@ -73,7 +76,8 @@ eight-hour GC. Existing queued GC jobs are reusable by the new runner.
 - A large or interrupted GC remains queued/runnable and is resumed by a later
   drain or scheduled invocation.
 - Cron and manual execution use the same bounded job runner.
-- The admin page reports completion/failure and refreshes after a manual GC.
+- The admin page reports scan completion/failure, makes queued deletions
+  explicit, and refreshes after a manual GC.
 - Pinned and keep-latest-protected versions remain untouched.
 
 ## Implementation notes
@@ -81,5 +85,7 @@ eight-hour GC. Existing queued GC jobs are reusable by the new runner.
 Implemented in the job scheduler, manual admin endpoint, inline console,
 Wrangler Cron configuration, documentation, and tests. Manual scheduling now
 reuses active GC work and drains bounded rounds immediately; larger jobs remain
-resumable through later drains and the eight-hour Cron trigger. No
-implementation deviations from this RFC were required.
+resumable through later drains and the eight-hour Cron trigger. The console
+labels completion as GC scan completion because deletion child jobs can remain
+queued after the parent scan job completes. No implementation deviations from
+this RFC were required.
