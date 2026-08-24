@@ -16,7 +16,7 @@ import {
   type RetentionOperator,
 } from "../domain/policy";
 import { emitAudit } from "../observability";
-import { getJob, createJob, createDeletionJob, findActiveDeletionJob, runJob } from "../jobs/jobs";
+import { getJob, createDeletionJob, findActiveDeletionJob, runQueuedJobs, scheduleGcJob, runJob } from "../jobs/jobs";
 import { bumpCacheGeneration, getSetting, getVersion, now, parseTags, type VersionRow } from "../storage/db";
 import { serializeVersion, validateNonNegativeInteger, validatePackageName, validateTags, validateVersionName } from "./versions";
 import { requireRole } from "../middleware/auth";
@@ -393,10 +393,10 @@ adminRoutes.get("/api/admin/jobs/:jobId", async (c) => {
 });
 
 adminRoutes.post("/api/admin/gc", async (c) => {
-  const jobId = await createJob(c.env, "gc", null, c.get("role"), { reason: "manual" });
-  await emitAudit(c.env, "gc_requested", c.get("role"), null, { jobId });
-  c.executionCtx.waitUntil(runJob(c.env, jobId));
-  return c.json({ jobId, status: "queued" }, 202);
+  const scheduled = await scheduleGcJob(c.env, c.get("role"), { reason: "manual" });
+  await emitAudit(c.env, "gc_requested", c.get("role"), null, { jobId: scheduled.id, reused: !scheduled.created });
+  c.executionCtx.waitUntil(runQueuedJobs(c.env, 4, 8));
+  return c.json({ jobId: scheduled.id, status: scheduled.status, reused: !scheduled.created }, 202);
 });
 
 type PolicyPayload = {

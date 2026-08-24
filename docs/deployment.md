@@ -1,7 +1,7 @@
 # Deployment guide
 
 This guide deploys Nix Cache Worker to Cloudflare Workers with R2, D1, Worker
-Secrets, and a daily garbage-collection trigger. The application does not
+Secrets, and an every-eight-hours garbage-collection trigger. The application does not
 create or modify Cloudflare bindings and Secrets through its web console.
 
 ## Prerequisites
@@ -55,7 +55,7 @@ Wrangler file. Keep production and preview/local resources separate when the
 deployment workflow requires isolation.
 
 The D1 binding must use `migrations_dir: "migrations"`. The Cron trigger in the
-template runs at 03:00 UTC daily and enqueues bounded GC work. The repository
+template runs at 00:00, 08:00, and 16:00 UTC and enqueues bounded GC work. The repository
 now contains one squashed baseline migration; future schema changes start at
 `0002`.
 

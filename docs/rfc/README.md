@@ -51,3 +51,4 @@ The RFCs currently recorded are:
 - [RFC-0011: admin retention remaining-time display](RFC-0011-admin-retention-remaining-time.md)
 - [RFC-0012: re-registration renews version age](RFC-0012-reregistration-renews-version-age.md)
 - [RFC-0013: precise admin registration and retention time display](RFC-0013-admin-time-precision.md)
+- [RFC-0014: scheduled and manual GC execution](RFC-0014-gc-scheduling-and-manual-execution.md)

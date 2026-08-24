@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { app } from "../src/app";
-import { createDeletionJob, runQueuedJobs } from "../src/jobs/jobs";
+import { createDeletionJob, runQueuedJobs, scheduleGcJob } from "../src/jobs/jobs";
 import { claimObjectWrite, releaseObjectWrite } from "../src/storage/r2";
 import type { Bindings } from "../src/env";
 import { homePage } from "../src/ui/home";
@@ -115,6 +115,8 @@ describe("Admin console page", () => {
     expect(html).toContain("const formatRetentionRemaining = (value)");
     expect(html).toContain('return "Expired"');
     expect(html).toContain('className = remainingSeconds < 0 ? "expired" : ""');
+    expect(html).toContain("waitForJob(jobId)");
+    expect(html).toContain('result.reused ? "GC already scheduled · " : "GC started · "');
     expect(html).toContain("No tags");
     expect(html).not.toContain('id="guide"');
     expect(html).toContain('id="publishing"');
@@ -491,6 +493,18 @@ describe("Nix cache HTTP API", () => {
     expect(payload[0]).toBeUndefined();
   });
 
+  it("reuses an active GC job and drains manual GC work", async () => {
+    const scheduled = await scheduleGcJob(testEnv, "test", { reason: "test" });
+    const manual = await request("/api/admin/gc", { method: "POST", headers: bearer("admin-secret") });
+    const body = await manual.response.json<{ jobId: string; reused: boolean }>();
+    expect(manual.response.status).toBe(202);
+    expect(body).toMatchObject({ jobId: scheduled.id, reused: true });
+    await Promise.all(manual.waitUntil);
+    expect((await testEnv.DB.prepare("SELECT status FROM jobs WHERE id = ?").bind(scheduled.id).first<{ status: string }>())?.status).toBe("completed");
+    const activeGcJobs = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM jobs WHERE type = 'gc' AND status IN ('queued', 'running', 'failed')").first<{ count: number }>();
+    expect(Number(activeGcJobs?.count ?? 0)).toBe(0);
+  });
+
   it("resumes deletion when objects are already marked deleting", async () => {
     const pair = await uploadPair("deleting-retry");
     const registration = await register("deleting-retry-package", "v1", [pair.narinfoKey]);
@@ -548,7 +562,6 @@ describe("Nix cache HTTP API", () => {
       .bind(new Date(base).toISOString(), "gc-package", "beta-only").run();
     const gc = await request("/api/admin/gc", { method: "POST", headers: bearer("admin-secret") });
     await Promise.all(gc.waitUntil);
-    await runQueuedJobs(testEnv, 10);
     const latest = await request("/api/admin/packages/gc-package/versions/newest", { headers: bearer("admin-secret") });
     expect(latest.response.status).toBe(200);
     expect((await request("/api/admin/packages/gc-package/versions/old", { headers: bearer("admin-secret") })).response.status).toBe(404);

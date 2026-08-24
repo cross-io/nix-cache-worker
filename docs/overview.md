@@ -271,7 +271,7 @@ by the structured-rule migration and must be recreated in the new editor.
 
 The default GC retention is 7 days. In addition to structured policies,
 the Worker protects the newest 3 versions for every exact package-name and
-complete-tag combination. A Workers Cron trigger runs GC once per day.
+complete-tag combination. A Workers Cron trigger runs GC every eight hours.
 Objects that are not registered to an active version use the existing six-hour
 HTTP cache TTL.
 

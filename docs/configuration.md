@@ -35,7 +35,7 @@ The checked-in example binds:
 - `CACHE_BUCKET` to the R2 bucket containing immutable cache objects;
 - `DB` to the D1 database containing indexes, memberships, policies, jobs, and
   audit metadata;
-- a daily `0 3 * * *` Cron trigger for garbage collection.
+- an every-eight-hours `0 */8 * * *` Cron trigger for garbage collection.
 
 The standard non-secret variables are:
 

@@ -1,4 +1,5 @@
 import type { Bindings } from "../env";
+import { AppError } from "../domain/errors";
 import { now } from "../storage/db";
 import { processDeleteVersion, processGc } from "./runner";
 
@@ -16,6 +17,12 @@ export type JobRow = {
   updated_at: string;
 };
 
+export type ScheduledGcJob = {
+  id: string;
+  status: JobRow["status"];
+  created: boolean;
+};
+
 export async function createJob(env: Bindings, type: JobRow["type"], targetVersionId: string | null, actor: string, payload: Record<string, unknown> = {}): Promise<string> {
   const id = crypto.randomUUID();
   const timestamp = now();
@@ -23,6 +30,30 @@ export async function createJob(env: Bindings, type: JobRow["type"], targetVersi
     "INSERT INTO jobs (id, type, status, target_version_id, payload_json, created_by, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?)",
   ).bind(id, type, targetVersionId, JSON.stringify(payload), actor, timestamp, timestamp).run();
   return id;
+}
+
+export async function scheduleGcJob(env: Bindings, actor: string, payload: Record<string, unknown> = {}): Promise<ScheduledGcJob> {
+  const existing = await env.DB.prepare(
+    "SELECT id, status FROM jobs WHERE type = 'gc' AND status IN ('queued', 'running', 'failed') ORDER BY created_at ASC LIMIT 1",
+  ).first<Pick<JobRow, "id" | "status">>();
+  if (existing) return { ...existing, created: false };
+
+  const id = crypto.randomUUID();
+  const timestamp = now();
+  const inserted = await env.DB.prepare(
+    `INSERT INTO jobs (id, type, status, target_version_id, payload_json, created_by, created_at, updated_at)
+     SELECT ?, 'gc', 'queued', NULL, ?, ?, ?, ?
+     WHERE NOT EXISTS (
+       SELECT 1 FROM jobs WHERE type = 'gc' AND status IN ('queued', 'running', 'failed')
+     )`,
+  ).bind(id, JSON.stringify(payload), actor, timestamp, timestamp).run();
+  if (inserted.meta.changes === 1) return { id, status: "queued", created: true };
+
+  const concurrent = await env.DB.prepare(
+    "SELECT id, status FROM jobs WHERE type = 'gc' AND status IN ('queued', 'running', 'failed') ORDER BY created_at ASC LIMIT 1",
+  ).first<Pick<JobRow, "id" | "status">>();
+  if (!concurrent) throw new AppError("gc_schedule_failed", "The GC job could not be scheduled", 503);
+  return { ...concurrent, created: false };
 }
 
 export async function findActiveDeletionJob(env: Bindings, versionId: string): Promise<JobRow | null> {
@@ -96,8 +127,8 @@ export async function touchJob(env: Bindings, id: string): Promise<void> {
   await env.DB.prepare("UPDATE jobs SET updated_at = ? WHERE id = ? AND status = 'running'").bind(now(), id).run();
 }
 
-export async function runQueuedJobs(env: Bindings, limit = 2): Promise<void> {
-  for (let round = 0; round < 4; round += 1) {
+export async function runQueuedJobs(env: Bindings, limit = 2, rounds = 4): Promise<void> {
+  for (let round = 0; round < rounds; round += 1) {
     const staleBefore = new Date(Date.now() - 15 * 60_000).toISOString();
     const jobs = await env.DB.prepare(
       `SELECT id FROM jobs
