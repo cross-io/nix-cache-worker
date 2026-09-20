@@ -24,7 +24,75 @@ netrc_file="$temporary_directory/netrc"
 printf 'machine %s login nix password %s\n' "$cache_host" "$NIX_CACHE_TESTING_WRITE_TOKEN" > "$netrc_file"
 chmod 600 "$netrc_file"
 
-cache_info="$(curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 2 "$base_url/nix-cache-info")"
+retry_cache_request() {
+  local attempt output response_status response_file
+  response_file="$temporary_directory/cache-response"
+  for attempt in $(seq 1 15); do
+    if ! response_status="$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' "$@")"; then
+      response_status="000"
+    fi
+    if [[ "$response_status" =~ ^2[0-9][0-9]$ ]]; then
+      output="$(<"$response_file")"
+      printf '%s' "$output"
+      return 0
+    fi
+    printf 'Cache request attempt %s returned HTTP %s\n' "$attempt" "$response_status" >&2
+    sleep 2
+  done
+  printf 'Cache object did not become available after 30 seconds: %s\n' "$*" >&2
+  return 1
+}
+
+retry_cache_status() {
+  local expected_status="$1"
+  shift
+  local attempt response_status
+  for attempt in $(seq 1 15); do
+    if ! response_status="$(curl --silent --show-error --location --output /dev/null --write-out '%{http_code}' "$@")"; then
+      response_status="000"
+    fi
+    if [[ "$response_status" == "$expected_status" ]]; then
+      return 0
+    fi
+    printf 'Cache status attempt %s expected HTTP %s but received %s\n' "$attempt" "$expected_status" "$response_status" >&2
+    sleep 2
+  done
+  return 1
+}
+
+retry_direct_r2_redirect() {
+  local attempt response_status response_headers location
+  response_headers="$temporary_directory/direct-redirect-headers"
+  for attempt in $(seq 1 15); do
+    if ! response_status="$(curl --silent --show-error --dump-header "$response_headers" --output /dev/null --write-out '%{http_code}' "$@")"; then
+      response_status="000"
+    fi
+    location="$(awk 'BEGIN { IGNORECASE = 1 } /^location:/ { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$response_headers" 2>/dev/null || true)"
+    if [[ "$response_status" == "307" && "$location" =~ ^https://[[:xdigit:]]{32}\.r2\.cloudflarestorage\.com/.*X-Amz-Algorithm=AWS4-HMAC-SHA256 ]]; then
+      return 0
+    fi
+    printf 'Direct-read attempt %s did not return a signed R2 redirect (HTTP %s)\n' "$attempt" "$response_status" >&2
+    sleep 2
+  done
+  return 1
+}
+
+retry_nix_store_cat_sha256() {
+  local store_path="$1"
+  local attempt digest
+  for attempt in $(seq 1 15); do
+    if digest="$(nix --option require-sigs false store cat --store "$base_url" "$store_path/payload" | sha256sum | awk '{print $1}')"; then
+      printf '%s' "$digest"
+      return 0
+    fi
+    printf 'Nix cache read attempt %s failed; retrying\n' "$attempt" >&2
+    sleep 2
+  done
+  printf 'Nix could not read %s after 30 seconds\n' "$store_path" >&2
+  return 1
+}
+
+cache_info="$(retry_cache_request "$base_url/nix-cache-info")"
 if ! grep --quiet '^StoreDir: /nix/store$' <<<"$cache_info"; then
   printf 'NIX_CACHE_TESTING_URL did not serve the expected Nix cache information\n' >&2
   exit 1
@@ -49,18 +117,18 @@ printf 'Uploading the sub-50 MiB NAR with nix copy...\n'
 nix --option netrc-file "$netrc_file" copy --to "$base_url" "$small_store_path"
 
 small_narinfo_key="$(basename "$small_store_path").narinfo"
-small_nar_key="$(curl --fail --silent --show-error "$base_url/$small_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
+small_nar_key="$(retry_cache_request "$base_url/$small_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
 if [[ -z "$small_nar_key" ]]; then
   printf 'The small Nix upload did not publish a usable narinfo\n' >&2
   exit 1
 fi
-small_nar_size="$(curl --fail --silent --show-error --head "$base_url/$small_nar_key" | awk 'BEGIN { IGNORECASE = 1 } /^content-length:/ { print $2 }' | tr -d '\r' | tail -n 1)"
+small_nar_size="$(retry_cache_request --head "$base_url/$small_nar_key" | awk 'BEGIN { IGNORECASE = 1 } /^content-length:/ { print $2 }' | tr -d '\r' | tail -n 1)"
 if [[ -z "$small_nar_size" || "$small_nar_size" -ge $((50 * 1024 * 1024)) ]]; then
   printf 'The small NAR did not stay below 50 MiB\n' >&2
   exit 1
 fi
 
-small_downloaded_sha256="$(nix --option require-sigs false store cat --store "$base_url" "$small_store_path/payload" | sha256sum | awk '{print $1}')"
+small_downloaded_sha256="$(retry_nix_store_cat_sha256 "$small_store_path")"
 if [[ "$small_downloaded_sha256" != "$small_expected_sha256" ]]; then
   printf 'Nix did not retrieve the expected small payload\n' >&2
   exit 1
@@ -137,7 +205,18 @@ curl --fail-with-body --silent --show-error \
   "$base_url/$large_narinfo_key" \
   --output /dev/null
 
-large_downloaded_sha256="$(nix --option require-sigs false store cat --store "$base_url" "$large_store_path/payload" | sha256sum | awk '{print $1}')"
+large_nar_etag="$(retry_cache_request --head "$base_url/$large_nar_key" | awk 'BEGIN { IGNORECASE = 1 } /^etag:/ { print $2 }' | tr -d '\r' | tail -n 1)"
+if [[ -z "$large_nar_etag" ]]; then
+  printf 'The direct large-NAR read did not return an ETag\n' >&2
+  exit 1
+fi
+retry_direct_r2_redirect "$base_url/$large_nar_key"
+retry_direct_r2_redirect --head "$base_url/$large_nar_key"
+retry_cache_status 206 --range 0-0 "$base_url/$large_nar_key"
+retry_cache_status 304 --header "If-None-Match: $large_nar_etag" "$base_url/$large_nar_key"
+retry_cache_status 412 --header 'If-Match: "never-match"' "$base_url/$large_nar_key"
+
+large_downloaded_sha256="$(retry_nix_store_cat_sha256 "$large_store_path")"
 if [[ "$large_downloaded_sha256" != "$large_expected_sha256" ]]; then
   printf 'Nix did not retrieve the expected large payload\n' >&2
   exit 1

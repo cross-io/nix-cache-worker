@@ -48,6 +48,7 @@ NIX_PUBLIC_SIGN_KEY=<optional-public-signing-key>
 R2_ACCOUNT_ID=<cloudflare-account-id>
 R2_BUCKET_NAME=<cache-bucket-name>
 DIRECT_UPLOAD_URL_TTL_SECONDS=3600
+DIRECT_DOWNLOAD_URL_TTL_SECONDS=900
 ```
 
 `NIX_PUBLIC_SIGN_KEY` is public metadata used by the home page's Nix client
@@ -56,6 +57,13 @@ Neither setting is a bearer secret.
 `R2_ACCOUNT_ID` and `R2_BUCKET_NAME` are used to construct the R2 S3 endpoint
 for presigned URLs. Presigned URLs use the R2 S3 API hostname and cannot use
 the Worker's custom domain.
+`DIRECT_DOWNLOAD_URL_TTL_SECONDS` is optional. When configured between 60
+seconds and seven days, supported NAR and narinfo GET/HEAD requests receive a
+short-lived `307` redirect to R2. The redirect is `no-store`; R2 is the source
+of truth and returns the final Range, ETag, and conditional response. Missing
+objects, and objects written before direct reads were enabled, stay on the
+binding-backed Worker path. Omit the setting to keep binding-backed Worker
+reads for every object.
 
 ## Worker Secrets
 
@@ -77,7 +85,7 @@ version-deletion operations. Anonymous cache reads remain enabled.
 
 The R2 S3 credentials must be a bucket-scoped R2 API token with object read and
 write permissions. They are used only by the Worker to create short-lived
-presigned URLs and must never be sent to CI clients.
+presigned upload and download URLs and must never be sent to CI clients.
 
 ## Nix clients and publishers
 
@@ -125,6 +133,12 @@ curl --fail-with-body -X POST \
 Only after completion should the corresponding `.narinfo` be uploaded through
 the normal cache PUT path. The direct flow uses one R2 single-object PUT and is
 not resumable; its maximum is the R2 single-upload limit.
+
+Stock `nix copy --to` cannot be transparently redirected to a presigned PUT:
+it has no upload-session discovery phase, and a redirect still places its
+request body at the Worker. CI publishers must use the explicit session API
+for direct NAR uploads. In contrast, `nix copy --from` and `nix store cat`
+follow the optional presigned GET/HEAD redirects automatically.
 
 ## Package/version lifecycle
 

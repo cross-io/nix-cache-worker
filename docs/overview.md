@@ -58,13 +58,15 @@ Large-NAR control-plane endpoints:
 - Missing objects return `404 Not Found`.
 - Malformed narinfo returns `422 Unprocessable Content`; a narinfo whose NAR dependency is missing returns `424 Failed Dependency`.
 - Cache objects are immutable. A repeated PUT with identical bytes is an idempotent success; a PUT with different bytes never overwrites the existing object and returns a conflict response.
-- R2 multipart upload is used internally for normal Worker PUTs. NARs larger
+- Normal Worker PUTs stream directly into one R2 single write. NARs larger
   than the Worker request-body limit use the direct single-PUT API; the R2
   presigned URL is not a multipart or resumable protocol.
-- The Worker uses Cloudflare's `caches.default` for successful full GET
-  responses and `/nix-cache-info`. HEAD can reuse a cached full GET; Range and
-  conditional requests continue through the R2 path. Cache generations change
-  when version metadata, retention rules, settings, or deletion state changes.
+- Unless direct-download redirects are enabled, the Worker uses Cloudflare's
+  `caches.default` for successful full GET responses and `/nix-cache-info`.
+  HEAD can reuse a cached full GET; Range and conditional requests continue
+  through the R2 path. Direct-download mode deliberately bypasses that Worker
+  cache and redirects to R2 instead. Cache generations change when version
+  metadata, retention rules, settings, or deletion state changes.
 
 ### Cache-Control defaults
 
@@ -81,6 +83,12 @@ their active versions. A version-level `retentionDays` override wins for that
 version; otherwise the largest matching structured rule duration and then the
 system default are used. This TTL is calculated when serving the response, so
 registering or updating a version does not require rewriting immutable R2 bytes.
+
+The table applies to binding-backed Worker responses. R2 object metadata stores
+`Cache-Control: no-store`, so new objects can safely use direct presigned
+reads. Older objects retain their existing metadata and stay on the
+binding-backed path. Direct presigned reads therefore cannot cache an object
+longer than a later retention-policy or deletion change permits.
 
 ### `nix-cache-info`
 
@@ -100,7 +108,7 @@ The supported upload order is therefore:
 2. Upload the corresponding `.narinfo`.
 3. Optionally register the resulting narinfo objects into a package version.
 
-This strict mode avoids serving metadata for an unavailable payload. The implementation must preserve this invariant even when uploads are retried, finalized through the direct-upload flow, or completed through internal multipart upload.
+This strict mode avoids serving metadata for an unavailable payload. The implementation must preserve this invariant even when uploads are retried or finalized through the direct-upload flow.
 
 ## Authentication
 

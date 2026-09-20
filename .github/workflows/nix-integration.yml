@@ -84,5 +84,8 @@ jobs:
             printf '%s' "${!variable_name}" | npx wrangler secret put "$variable_name" --config wrangler.integration.generated.jsonc
           done
 
+      - name: Restore the complete testing deployment after secret rotation
+        run: npx wrangler deploy --config wrangler.integration.generated.jsonc
+
       - name: Run the real Nix cache integration test
         run: bash scripts/integration/nix-cache-e2e.sh

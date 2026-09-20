@@ -13,7 +13,8 @@
     "NIX_PUBLIC_SIGN_KEY": "",
     "R2_ACCOUNT_ID": "__CLOUDFLARE_ACCOUNT_ID__",
     "R2_BUCKET_NAME": "nix-cache-testing",
-    "DIRECT_UPLOAD_URL_TTL_SECONDS": "900"
+    "DIRECT_UPLOAD_URL_TTL_SECONDS": "900",
+    "DIRECT_DOWNLOAD_URL_TTL_SECONDS": "300"
   },
   "r2_buckets": [
     {

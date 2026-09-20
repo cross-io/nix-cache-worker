@@ -54,6 +54,8 @@ reusable; its retention is therefore bounded to roughly 75 minutes.
 
 The test uses `require-sigs = false` only because the fixture's generated
 narinfos are unsigned. It does not relax the Worker authorization boundary.
+The test configuration enables the presigned read mode from RFC-0018, so Nix
+also proves that it can retrieve both fixtures after a Worker redirect to R2.
 
 ## Invariants and security
 
@@ -87,6 +89,11 @@ the application's existing migration chain.
 - A Nix-generated NAR larger than 100 MiB is uploaded by the presigned direct
   flow, followed by its standard narinfo PUT, and read by Nix from the deployed
   cache.
+- Both Nix readbacks follow the configured presigned R2 GET/HEAD redirect.
+- The direct large-NAR path returns the expected R2 Range and ETag conditional
+  responses before Nix reads it.
+- The integration script confirms that its direct large-NAR GET and HEAD first
+  receive a signed R2 redirect without emitting the bearer URL.
 - Successful tests complete their authorized deletion job and remove final test
   NARs. Staging cleanup is deferred safely until URL expiry and the next hourly
   Cron run.

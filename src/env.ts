@@ -12,6 +12,7 @@ export type Bindings = {
   R2_S3_ACCESS_KEY_ID?: string;
   R2_S3_SECRET_ACCESS_KEY?: string;
   DIRECT_UPLOAD_URL_TTL_SECONDS?: string;
+  DIRECT_DOWNLOAD_URL_TTL_SECONDS?: string;
   DEFAULT_STORE_DIR?: string;
   DEFAULT_PRIORITY?: string;
   DEFAULT_WANT_MASS_QUERY?: string;

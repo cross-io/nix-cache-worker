@@ -11,6 +11,11 @@ export type PresignedPut = {
   expiresAt: string;
 };
 
+export type PresignedRead = {
+  url: string;
+  expiresAt: string;
+};
+
 function configuredValue(value: string | undefined, name: string): string {
   if (!value) throw new AppError("direct_upload_unconfigured", `The ${name} direct-upload setting is not configured`, 503);
   return value;
@@ -106,15 +111,44 @@ export async function createPresignedPut(
   expiresInSeconds: number,
   issuedAt = new Date(),
 ): Promise<PresignedPut> {
+  const contentType = "application/octet-stream";
+  const ifNoneMatch = "*";
+  const presigned = await createPresignedRequest(env, key, "PUT", expiresInSeconds, {
+    "content-type": contentType,
+    "if-none-match": ifNoneMatch,
+  }, issuedAt);
+  return {
+    ...presigned,
+    headers: { "Content-Type": contentType, "If-None-Match": ifNoneMatch },
+  };
+}
+
+export async function createPresignedRead(
+  env: Bindings,
+  key: string,
+  method: "GET" | "HEAD",
+  expiresInSeconds: number,
+  issuedAt = new Date(),
+): Promise<PresignedRead> {
+  return createPresignedRequest(env, key, method, expiresInSeconds, {}, issuedAt);
+}
+
+async function createPresignedRequest(
+  env: Bindings,
+  key: string,
+  method: "GET" | "HEAD" | "PUT",
+  expiresInSeconds: number,
+  requestHeaders: Record<string, string>,
+  issuedAt: Date,
+): Promise<PresignedRead> {
   const expires = clampExpiry(expiresInSeconds);
   const target = endpoint(env);
   const host = target.host;
   const path = canonicalPath(env, key);
-  const contentType = "application/octet-stream";
-  const ifNoneMatch = "*";
   const { short, long } = timestampParts(issuedAt);
   const credential = `${accessKeyId(env)}/${short}/${AWS_REGION}/${AWS_SERVICE}/aws4_request`;
-  const signedHeaders = "content-type;host;if-none-match";
+  const signedHeaderNames = ["host", ...Object.keys(requestHeaders)].sort();
+  const signedHeaders = signedHeaderNames.join(";");
   const query = canonicalQuery([
     ["X-Amz-Algorithm", "AWS4-HMAC-SHA256"],
     ["X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD"],
@@ -123,13 +157,10 @@ export async function createPresignedPut(
     ["X-Amz-Expires", String(expires)],
     ["X-Amz-SignedHeaders", signedHeaders],
   ]);
-  const canonicalHeaders = [
-    `content-type:${canonicalHeaderValue(contentType)}`,
-    `host:${canonicalHeaderValue(host)}`,
-    `if-none-match:${canonicalHeaderValue(ifNoneMatch)}`,
-    "",
-  ].join("\n");
-  const canonicalRequest = ["PUT", path, query, canonicalHeaders, signedHeaders, "UNSIGNED-PAYLOAD"].join("\n");
+  const canonicalHeaders = signedHeaderNames
+    .map((name) => `${name}:${canonicalHeaderValue(name === "host" ? host : requestHeaders[name] ?? "")}`)
+    .join("\n") + "\n";
+  const canonicalRequest = [method, path, query, canonicalHeaders, signedHeaders, "UNSIGNED-PAYLOAD"].join("\n");
   const canonicalRequestHash = await sha256(canonicalRequest);
   const scope = `${short}/${AWS_REGION}/${AWS_SERVICE}/aws4_request`;
   const dateKey = await hmac(new TextEncoder().encode(`AWS4${secretAccessKey(env)}`), short);
@@ -139,11 +170,7 @@ export async function createPresignedPut(
   const signature = hex(await hmac(signingKey, `AWS4-HMAC-SHA256\n${long}\n${scope}\n${canonicalRequestHash}`));
   const url = `${target.origin}${path}?${query}&X-Amz-Signature=${signature}`;
   const expiresAt = new Date(issuedAt.getTime() + expires * 1000).toISOString();
-  return {
-    url,
-    headers: { "Content-Type": contentType, "If-None-Match": ifNoneMatch },
-    expiresAt,
-  };
+  return { url, expiresAt };
 }
 
 export function directUploadTtl(env: Bindings): number {
@@ -152,6 +179,16 @@ export function directUploadTtl(env: Bindings): number {
   const value = Number(configured);
   if (!Number.isInteger(value) || value < 60 || value > MAX_PRESIGN_SECONDS) {
     throw new AppError("invalid_upload_expiry", `DIRECT_UPLOAD_URL_TTL_SECONDS must be between 60 and ${MAX_PRESIGN_SECONDS}`, 503);
+  }
+  return value;
+}
+
+export function directDownloadTtl(env: Bindings): number | null {
+  const configured = env.DIRECT_DOWNLOAD_URL_TTL_SECONDS;
+  if (!configured) return null;
+  const value = Number(configured);
+  if (!Number.isInteger(value) || value < 60 || value > MAX_PRESIGN_SECONDS) {
+    throw new AppError("invalid_download_expiry", `DIRECT_DOWNLOAD_URL_TTL_SECONDS must be between 60 and ${MAX_PRESIGN_SECONDS}`, 503);
   }
   return value;
 }

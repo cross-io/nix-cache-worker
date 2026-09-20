@@ -70,10 +70,14 @@ beforeAll(async () => {
   ).bind("default-package-tags", "[]", '["pkg_name","pkg_tags"]', 3, null, null, "2026-08-01T00:00:00.000Z", "2026-08-01T00:00:00.000Z").run();
 });
 
-async function request(path: string, init: RequestInit = {}): Promise<{ response: Response; waitUntil: Promise<unknown>[] }> {
+async function request(path: string, init: RequestInit = {}, inferContentLength = true): Promise<{ response: Response; waitUntil: Promise<unknown>[] }> {
   const waiters: Promise<unknown>[] = [];
   const ctx = { waitUntil(promise: Promise<unknown>) { waiters.push(promise); } } as ExecutionContext;
-  const response = await app.fetch(new Request(`https://cache.test${path}`, init), testEnv, ctx);
+  const headers = new Headers(init.headers);
+  if (inferContentLength && init.method === "PUT" && typeof init.body === "string" && !headers.has("Content-Length")) {
+    headers.set("Content-Length", String(new TextEncoder().encode(init.body).byteLength));
+  }
+  const response = await app.fetch(new Request(`https://cache.test${path}`, { ...init, headers }), testEnv, ctx);
   return { response, waitUntil: waiters };
 }
 
@@ -117,6 +121,21 @@ async function sha256Bytes(value: Uint8Array): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function chunkedBody(value: Uint8Array, chunkSize: number): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (offset >= value.byteLength) {
+        controller.close();
+        return;
+      }
+      const end = Math.min(offset + chunkSize, value.byteLength);
+      controller.enqueue(value.subarray(offset, end));
+      offset = end;
+    },
+  });
+}
+
 function awsEncodeForTest(value: string): string {
   return encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 }
@@ -132,7 +151,7 @@ async function hmacBytes(key: Uint8Array, value: string): Promise<Uint8Array> {
   return new Uint8Array(signature);
 }
 
-async function referencePresignedSignature(url: string, headers: Record<string, string>, secret: string): Promise<string> {
+async function referencePresignedSignature(url: string, headers: Record<string, string>, secret: string, method = "PUT"): Promise<string> {
   const parsed = new URL(url);
   const query = Array.from(parsed.searchParams.entries())
     .filter(([name]) => name !== "X-Amz-Signature")
@@ -144,7 +163,7 @@ async function referencePresignedSignature(url: string, headers: Record<string, 
   const requestHeaders = new Map(Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]));
   requestHeaders.set("host", parsed.host);
   const canonicalHeaders = signedHeaders.split(";").map((name) => `${name}:${(requestHeaders.get(name) ?? "").trim().replace(/[\t ]+/g, " ")}`).join("\n");
-  const canonicalRequest = ["PUT", parsed.pathname, query, `${canonicalHeaders}\n`, signedHeaders, "UNSIGNED-PAYLOAD"].join("\n");
+  const canonicalRequest = [method, parsed.pathname, query, `${canonicalHeaders}\n`, signedHeaders, "UNSIGNED-PAYLOAD"].join("\n");
   const requestDigest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalRequest));
   const date = parsed.searchParams.get("X-Amz-Date") ?? "";
   const scope = parsed.searchParams.get("X-Amz-Credential")?.split("/").slice(1).join("/") ?? "";
@@ -394,15 +413,24 @@ describe("Nix cache HTTP API", () => {
     expect((await testEnv.DB.prepare("SELECT sha256 FROM objects WHERE r2_key = ?").bind(key).first<{ sha256: string }>())?.sha256).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("completes and replays an internal multipart upload", async () => {
+  it("completes and replays a streamed standard upload above the old multipart threshold", async () => {
     const body = new Uint8Array(8 * 1024 * 1024 + 1);
     body.fill(7);
     const headers = { ...bearer("write-secret"), "Content-Length": String(body.byteLength) };
-    const first = await request("/nar/multipart-retry.nar", { method: "PUT", headers, body });
+    const first = await request("/nar/standard-stream-retry.nar", { method: "PUT", headers, body: chunkedBody(body, 16 * 1024) });
     expect(first.response.status).toBe(201);
-    const replay = await request("/nar/multipart-retry.nar", { method: "PUT", headers, body });
+    const replay = await request("/nar/standard-stream-retry.nar", { method: "PUT", headers, body });
     expect(replay.response.status).toBe(204);
     expect(replay.response.headers.get("ETag")).toBe(first.response.headers.get("ETag"));
+  });
+
+  it("requires Content-Length for a streamed standard upload", async () => {
+    const response = await request("/nar/missing-content-length.nar", {
+      method: "PUT",
+      headers: bearer("write-secret"),
+      body: "streaming-without-length",
+    }, false);
+    expect(response.response.status).toBe(411);
   });
 
   it("requires write access for direct upload sessions", async () => {
@@ -421,6 +449,53 @@ describe("Nix cache HTTP API", () => {
     const presigned = await createPresignedPut(testEnv, "_nix_uploads/reference-vector", 3600, new Date("2026-01-02T03:04:05.000Z"));
     const signature = new URL(presigned.url).searchParams.get("X-Amz-Signature");
     expect(signature).toBe(await referencePresignedSignature(presigned.url, presigned.headers, testEnv.R2_S3_SECRET_ACCESS_KEY as string));
+  });
+
+  it("redirects supported cache paths to short-lived R2 URLs when direct reads are enabled", async () => {
+    const key = "nar/direct-read.nar";
+    const body = "direct-read";
+    expect((await request(`/${key}`, { method: "PUT", headers: bearer("write-secret"), body })).response.status).toBe(201);
+    expect((await testEnv.CACHE_BUCKET.head(key))?.httpMetadata?.cacheControl).toBe("no-store");
+    testEnv.DIRECT_DOWNLOAD_URL_TTL_SECONDS = "300";
+    try {
+      const get = await request(`/${key}`);
+      expect(get.response.status).toBe(307);
+      expect(get.response.headers.get("Cache-Control")).toBe("no-store");
+      const getLocation = new URL(get.response.headers.get("Location") ?? "");
+      expect(getLocation.origin).toBe("https://00000000000000000000000000000000.r2.cloudflarestorage.com");
+      expect(getLocation.pathname).toBe(`/nix-cache-test/${key}`);
+      expect(getLocation.searchParams.get("X-Amz-Algorithm")).toBe("AWS4-HMAC-SHA256");
+      expect(getLocation.searchParams.get("X-Amz-SignedHeaders")).toBe("host");
+      expect(getLocation.toString()).not.toContain("test-secret-key");
+      expect(getLocation.searchParams.get("X-Amz-Signature")).toBe(
+        await referencePresignedSignature(getLocation.toString(), {}, testEnv.R2_S3_SECRET_ACCESS_KEY as string, "GET"),
+      );
+
+      const head = await request(`/${key}`, { method: "HEAD" });
+      expect(head.response.status).toBe(307);
+      expect(head.response.headers.get("Location")).not.toBe(get.response.headers.get("Location"));
+      expect(new URL(head.response.headers.get("Location") ?? "").searchParams.get("X-Amz-Signature")).toBe(
+        await referencePresignedSignature(head.response.headers.get("Location") ?? "", {}, testEnv.R2_S3_SECRET_ACCESS_KEY as string, "HEAD"),
+      );
+
+      const rangedHead = await request(`/${key}`, { method: "HEAD", headers: { Range: "bytes=0-3" } });
+      expect(rangedHead.response.status).toBe(206);
+      expect(rangedHead.response.headers.get("Content-Range")).toBe("bytes 0-3/11");
+      expect(rangedHead.response.headers.get("Content-Length")).toBe("4");
+
+      const legacyKey = "nar/direct-read-legacy.nar";
+      await testEnv.CACHE_BUCKET.put(legacyKey, "legacy", {
+        httpMetadata: { contentType: "application/x-nix-nar", cacheControl: "public, max-age=31536000, immutable" },
+      });
+      const legacy = await request(`/${legacyKey}`);
+      expect(legacy.response.status).toBe(200);
+      expect(legacy.response.headers.get("Location")).toBeNull();
+      expect(legacy.response.headers.get("Cache-Control")).toContain("max-age=21600");
+
+      expect((await request("/not-present.narinfo")).response.status).toBe(404);
+    } finally {
+      delete testEnv.DIRECT_DOWNLOAD_URL_TTL_SECONDS;
+    }
   });
 
   it("serializes concurrent direct-upload session initialization", async () => {

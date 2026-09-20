@@ -10,8 +10,8 @@ Cloudflare Workers request-body limits therefore prevent the Worker from
 accepting NARs larger than the configured account limit, even though R2 can
 store much larger objects.
 
-The Worker already uses R2 multipart uploads internally, but that still sends
-the client request body through the Worker. It does not bypass the inbound
+The Worker previously used R2 multipart uploads internally, but that still sent
+the client request body through the Worker. It did not bypass the inbound
 request limit. A transparent redirect cannot provide a multipart protocol and
 would also leave the D1 object index and immutable-write checks outside the
 completion path.
@@ -124,7 +124,7 @@ The CI flow is:
 - an incomplete NAR still causes `.narinfo` upload to return `424`;
 - a completed NAR can be followed by a normal `.narinfo` PUT;
 - expired and completed staging sessions are cleaned up in bounded batches;
-- existing standard PUT and internal multipart tests continue to pass.
+- existing standard PUT tests continue to pass.
 
 ## Implementation notes
 
@@ -141,5 +141,7 @@ the presigned URL expires so `If-None-Match: *` cannot be reused to recreate
 staging data; the scheduled cleanup then removes the object and session row.
 The finalization path uses the Worker R2 binding to stream into a conditional
 final write, preserving the existing binding-based storage boundary rather
-than adding an S3 copy dependency. Type checking, the full 49-test suite, and
-the Wrangler dry-run build pass.
+than adding an S3 copy dependency. RFC-0019 later removed the unrelated
+Worker-managed multipart path for standard PUTs; large publishing remains this
+explicit direct-upload flow. Type checking, the full 49-test suite, and the
+Wrangler dry-run build pass.

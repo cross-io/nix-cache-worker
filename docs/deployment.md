@@ -34,7 +34,8 @@ Edit the ignored `wrangler.jsonc` and set:
 4. `NIX_PUBLIC_SIGN_KEY` to the public key used by your signed narinfos, if
    signature verification is enabled.
 5. `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, and optionally
-   `DIRECT_UPLOAD_URL_TTL_SECONDS` for large direct NAR uploads.
+   `DIRECT_UPLOAD_URL_TTL_SECONDS` for large direct NAR uploads and
+   `DIRECT_DOWNLOAD_URL_TTL_SECONDS` for direct R2 cache reads.
 6. An optional custom-domain route in the Cloudflare Dashboard or in the
    private Wrangler file.
 
@@ -124,9 +125,10 @@ If narinfos are signed, set `NIX_PUBLIC_SIGN_KEY` to the matching public key,
 deploy again, and verify that the public `/` page displays the expected key.
 Never upload or commit the corresponding private signing key.
 
-For direct NAR uploads, create the R2 S3 API token with object read/write
-permissions scoped to the cache bucket. The presigned URL uses the R2 S3 API
-hostname, not the Worker custom domain. Keep its URL out of logs and CI output.
+For direct NAR uploads and optional direct cache reads, create the R2 S3 API
+token with object read/write permissions scoped to the cache bucket. Presigned
+URLs use the R2 S3 API hostname, not the Worker custom domain. Keep their URLs
+out of logs and CI output.
 
 ## 7. Verify the deployment
 
@@ -146,7 +148,9 @@ perform an end-to-end test from a controlled Nix client:
    PUT the file to the returned R2 URL, and call the completion endpoint.
 3. Upload or observe the corresponding narinfo.
 4. Register the package/version with the write-token API.
-5. Read the result with `nix copy --from` or `nix store cat --store`.
+5. Read the result with `nix copy --from` or `nix store cat --store`; when
+   direct reads are enabled, verify that Nix follows the short-lived R2
+   redirect.
 6. Test a Range request and inspect the Worker logs for safe structured events.
 
 Replace `cache.example.org` with the real HTTPS hostname. Do not paste real

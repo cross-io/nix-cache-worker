@@ -40,8 +40,8 @@ Maintain support for:
 - ETag, `If-None-Match`, and `If-Match` semantics.
 - Accurate `Content-Length` and `Content-Range` headers.
 - Standard `/nix-cache-info`, `.narinfo`, and `/nar/*` paths.
-- Multipart upload for large NAR objects.
-- Internal R2 multipart must remain invisible to normal Nix clients, which continue to use standard PUT.
+- Streamed single R2 writes for ordinary standard PUTs; large NAR publishing
+  uses the explicit direct-upload session.
 
 Do not introduce a custom upload protocol as a prerequisite for normal Nix cache operation.
 
@@ -51,7 +51,7 @@ Do not introduce a custom upload protocol as a prerequisite for normal Nix cache
 - A different-content PUT must never overwrite an existing object.
 - Conditional request failures must be reported with the correct HTTP precondition status.
 - Uploading a narinfo before its NAR is available must fail in strict consistency mode.
-- Retries and multipart completion must not create duplicate or partially visible cache objects.
+- Retries and direct-upload completion must not create duplicate or partially visible cache objects.
 
 ## Artifact sets, policies, and GC
 
@@ -101,7 +101,7 @@ Changes affecting cache behavior should include tests for the relevant scenarios
 - GET, HEAD, Range, ETag, conditional requests, and Content-Length.
 - Same-content idempotent PUT and different-content conflict.
 - Missing-NAR rejection for narinfo upload.
-- Multipart upload completion and retry behavior.
+- Direct-upload completion and retry behavior.
 - Package/version registration idempotency and arbitrary tags.
 - Glob selector matching and `keepLatestVersions` ordering by `registered_at` per package.
 - Pin protection during automatic GC.

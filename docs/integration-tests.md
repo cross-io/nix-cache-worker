@@ -74,7 +74,12 @@ The test makes two independent cache entries:
 
 The large case intentionally uses the direct-upload protocol: stock `nix copy
 --to` cannot discover or use this API, and routing its 100+ MiB request through
-the Worker would not validate the purpose of the feature.
+the Worker would not validate the purpose of the feature. The testing
+configuration also enables five-minute presigned R2 read redirects, so both
+Nix readback checks verify that Nix follows the direct data-plane URL. The
+large-object case also verifies the redirected R2 Range, `If-None-Match`, and
+`If-Match` responses before Nix reads the payload. It first asserts that both
+GET and HEAD return a signed `307` R2 URL without logging that bearer URL.
 
 After both reads succeed, the script registers the two narinfos as a temporary
 test version and uses the admin deletion job to remove the version, narinfos,

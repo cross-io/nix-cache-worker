@@ -11,6 +11,7 @@ It supports:
 - standard `nix copy --to` and `nix copy --from` workflows;
 - public cache reads with authenticated writes;
 - direct-to-R2 single-PUT uploads for NARs larger than the Worker request limit;
+- optional presigned R2 redirects for cache-object reads;
 - package and build-version organization with tags;
 - retention policies, pins, and bounded garbage collection;
 - an authenticated web console for operations and administration.
@@ -58,6 +59,12 @@ direct-upload API documented in [`docs/configuration.md`](docs/configuration.md)
 The client uploads the file directly to an R2 presigned URL, then asks the
 Worker to verify and finalize it. This is a CI upload path; it does not change
 the standard `nix copy --to` protocol.
+
+Deployments may also set `DIRECT_DOWNLOAD_URL_TTL_SECONDS` to redirect
+supported NAR and narinfo GET/HEAD requests to short-lived R2 URLs. Stock Nix
+clients follow those redirects, so R2 supplies the authoritative object,
+Range, and conditional response directly. Missing objects and older objects
+with pre-existing R2 cache metadata remain on the Worker read path.
 
 ## Development
 

@@ -7,6 +7,7 @@ import { getObjectResponse, putImmutableObject } from "../storage/r2";
 import { requireRole } from "../middleware/auth";
 import { handleNarinfoPut } from "./narinfo";
 import { emitWorkerCacheHit, matchWorkerCache, responseForRequestMethod, scheduleWorkerCachePut } from "../storage/worker-cache";
+import { directDownloadTtl } from "../storage/presign";
 
 export const cacheRoutes = new Hono<AppEnv>();
 
@@ -35,14 +36,17 @@ cacheRoutes.on(["GET", "HEAD"], "/*", async (c) => {
   const key = normalizeKeyFromUrl(new URL(c.req.url));
   const kind = kindForKey(key);
   if (kind === "cache-info") throw new AppError("not_found", "The cache information route was not found", 404);
+  const directDownloads = directDownloadTtl(c.env) !== null;
   const generation = await getSetting(c.env, "worker_cache_generation") ?? "0";
-  const cached = await matchWorkerCache(c.req.raw, generation);
-  if (cached) {
-    emitWorkerCacheHit(key, kind, c.req.raw, cached);
-    return responseForRequestMethod(cached, c.req.method);
+  if (!directDownloads) {
+    const cached = await matchWorkerCache(c.req.raw, generation);
+    if (cached) {
+      emitWorkerCacheHit(key, kind, c.req.raw, cached);
+      return responseForRequestMethod(cached, c.req.method);
+    }
   }
   const response = await getObjectResponse(c.env, c.req.raw, key, kind);
-  scheduleWorkerCachePut(c.executionCtx, c.req.raw, response, generation);
+  if (!directDownloads) scheduleWorkerCachePut(c.executionCtx, c.req.raw, response, generation);
   return response;
 });
 

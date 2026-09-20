@@ -55,3 +55,5 @@ The RFCs currently recorded are:
 - [RFC-0015: retention group capacity](RFC-0015-retention-group-capacity.md)
 - [RFC-0016: presigned single-PUT uploads for large NARs](RFC-0016-presigned-single-put-uploads.md)
 - [RFC-0017: real Nix integration testing](RFC-0017-real-nix-integration-testing.md)
+- [RFC-0018: presigned cache reads](RFC-0018-presigned-cache-reads.md)
+- [RFC-0019: direct large-NAR publishing and removal of Worker multipart](RFC-0019-direct-large-nar-publishing.md)

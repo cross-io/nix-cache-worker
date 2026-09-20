@@ -12,7 +12,8 @@
     "NIX_PUBLIC_SIGN_KEY": "",
     "R2_ACCOUNT_ID": "replace-with-cloudflare-account-id",
     "R2_BUCKET_NAME": "replace-with-r2-bucket-name",
-    "DIRECT_UPLOAD_URL_TTL_SECONDS": "3600"
+    "DIRECT_UPLOAD_URL_TTL_SECONDS": "3600",
+    "DIRECT_DOWNLOAD_URL_TTL_SECONDS": "900"
   },
   "r2_buckets": [
     {

@@ -1,13 +1,12 @@
 import type { Bindings } from "../env";
 import { AppError } from "../domain/errors";
-import { cacheControlFor, contentTypeFor, type ObjectKind } from "../domain/keys";
-import { hashStream, Sha256 } from "../domain/sha256";
+import { contentTypeFor, type ObjectKind } from "../domain/keys";
+import { hashStream } from "../domain/sha256";
 import { emitMetric } from "../observability";
 import { getObject, now, upsertObject } from "./db";
 import { cacheControlForObject } from "./retention";
+import { createPresignedRead, directDownloadTtl } from "./presign";
 
-const MULTIPART_THRESHOLD = 8 * 1024 * 1024;
-const PART_SIZE = 8 * 1024 * 1024;
 const WRITE_CLAIM_TTL_MS = 15 * 60_000;
 const WRITE_CLAIM_CLEANUP_INTERVAL_MS = 60_000;
 let lastWriteClaimCleanupAt = 0;
@@ -21,7 +20,10 @@ export type UploadResult = {
 export function httpMetadataFor(kind: ObjectKind): R2HTTPMetadata {
   return {
     contentType: contentTypeFor(kind),
-    cacheControl: cacheControlFor(kind),
+    // Binding-backed responses calculate retention-aware cache policy at read
+    // time. Store no cache directive on R2 itself so a direct presigned read
+    // cannot outlive a later retention-policy or deletion change.
+    cacheControl: "no-store",
   };
 }
 
@@ -142,57 +144,6 @@ async function duplicateDecision(env: Bindings, key: string, kind: ObjectKind, r
   return duplicateDecisionByDigest(env, key, kind, incoming, existing, indexed);
 }
 
-async function multipartPut(env: Bindings, key: string, kind: ObjectKind, request: Request, owner: string): Promise<UploadResult> {
-  if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
-  const upload = await env.CACHE_BUCKET.createMultipartUpload(key, { httpMetadata: httpMetadataFor(kind) });
-  const reader = request.body.getReader();
-  const hash = new Sha256();
-  const parts: R2UploadedPart[] = [];
-  let partNumber = 1;
-  let size = 0;
-  let pending = new Uint8Array(0);
-  let lastRenewedAt = Date.now();
-  try {
-    while (true) {
-      const result = await reader.read();
-      if (result.done) break;
-      if (Date.now() - lastRenewedAt >= WRITE_CLAIM_TTL_MS / 3) {
-        await renewObjectWrite(env, key, owner);
-        lastRenewedAt = Date.now();
-      }
-      const chunk = result.value;
-      hash.update(chunk);
-      size += chunk.byteLength;
-      const combined = new Uint8Array(pending.byteLength + chunk.byteLength);
-      combined.set(pending);
-      combined.set(chunk, pending.byteLength);
-      pending = combined;
-      while (pending.byteLength >= PART_SIZE) {
-        const part = pending.slice(0, PART_SIZE);
-        pending = pending.slice(PART_SIZE);
-        parts.push(await upload.uploadPart(partNumber, part));
-        await renewObjectWrite(env, key, owner);
-        lastRenewedAt = Date.now();
-        partNumber += 1;
-      }
-    }
-    if (pending.byteLength > 0 || parts.length === 0) {
-      parts.push(await upload.uploadPart(partNumber, pending));
-    }
-    await renewObjectWrite(env, key, owner);
-    const object = await upload.complete(parts);
-    emitMetric("r2_put", { key, kind, status: 201, duplicate: false, bytes: size, multipart: true });
-    return { object, duplicate: false, sha256: hash.digest() };
-  } catch (error) {
-    try {
-      await upload.abort();
-    } catch (abortError) {
-      console.error(JSON.stringify({ event: "multipart_abort_error", key, message: abortError instanceof Error ? abortError.message : String(abortError) }));
-    }
-    throw error;
-  }
-}
-
 export async function putImmutableObject(env: Bindings, key: string, kind: ObjectKind, request: Request): Promise<UploadResult> {
   const owner = await claimObjectWrite(env, key);
   if (!owner) throw new AppError("upload_in_progress", "Another upload for this object is in progress", 409);
@@ -229,25 +180,19 @@ export async function putImmutableObject(env: Bindings, key: string, kind: Objec
   }
 
   const contentLengthText = request.headers.get("Content-Length");
-  const contentLengthValid = contentLengthText !== null && /^\d+$/.test(contentLengthText) && Number.isSafeInteger(Number(contentLengthText));
-  const parsedContentLength = contentLengthValid ? Number(contentLengthText) : 0;
-  const contentLength = Number.isSafeInteger(parsedContentLength) ? parsedContentLength : 0;
-  const useMultipart = contentLength > MULTIPART_THRESHOLD || (kind === "nar" && !contentLengthValid);
+  if (contentLengthText === null || !/^\d+$/.test(contentLengthText) || !Number.isSafeInteger(Number(contentLengthText))) {
+    await releaseObjectWrite(env, key, owner);
+    throw new AppError("content_length_required", "Standard PUT uploads must include a valid Content-Length", 411);
+  }
+  const contentLength = Number(contentLengthText);
   try {
     const raced = await env.CACHE_BUCKET.head(key);
     if (raced) return duplicateDecision(env, key, kind, request, raced, await getObject(env, key));
 
-    if (useMultipart) {
-      const result = await multipartPut(env, key, kind, request, owner);
-      emitMetric("upload_bytes", { key, kind, status: 201, bytes: result.object.size });
-      await upsertObject(env, { key, kind, etag: result.object.httpEtag, sha256: result.sha256, size: result.object.size });
-      return result;
-    }
-
     if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
     const [hashBody, uploadBody] = request.body.tee();
     const hashPromise = hashStream(hashBody);
-    const object = await env.CACHE_BUCKET.put(key, uploadBody, {
+    const object = await env.CACHE_BUCKET.put(key, streamWithWriteClaim(env, key, owner, uploadBody, contentLength), {
       onlyIf: { etagDoesNotMatch: "*" },
       httpMetadata: httpMetadataFor(kind),
     });
@@ -267,7 +212,26 @@ export async function putImmutableObject(env: Bindings, key: string, kind: Objec
 }
 
 export async function getObjectResponse(env: Bindings, request: Request, key: string, kind: ObjectKind): Promise<Response> {
-  const head = await env.CACHE_BUCKET.head(key);
+  const downloadTtl = directDownloadTtl(env);
+  // Older objects retain their upload-time cache directives. Keep those on the
+  // binding path, where retention policy is evaluated for every response.
+  const directHead = downloadTtl !== null ? await env.CACHE_BUCKET.head(key) : null;
+  if (
+    downloadTtl !== null
+    && directHead?.httpMetadata?.cacheControl === "no-store"
+    && (request.method === "GET" || !request.headers.has("Range"))
+  ) {
+    const presigned = await createPresignedRead(env, key, request.method as "GET" | "HEAD", downloadTtl);
+    emitMetric("r2_get", { key, kind, method: request.method, operation: "presigned_redirect", status: 307, bytes: 0 });
+    return new Response(null, {
+      status: 307,
+      headers: {
+        "Cache-Control": "no-store",
+        Location: presigned.url,
+      },
+    });
+  }
+  const head = directHead ?? await env.CACHE_BUCKET.head(key);
   emitMetric("r2_get", { key, kind, method: request.method, operation: "head", status: head ? 200 : 404, bytes: 0 });
   if (!head) {
     emitMetric("cache_miss", { key, kind, method: request.method, status: 404, bytes: 0 });
