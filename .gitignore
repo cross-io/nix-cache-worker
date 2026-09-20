@@ -5,6 +5,7 @@ node_modules/
 .wrangler/
 wrangler.jsonc
 wrangler.local.jsonc
+wrangler.integration.generated.jsonc
 .dev.vars
 .dev.vars.*
 !.dev.vars.example

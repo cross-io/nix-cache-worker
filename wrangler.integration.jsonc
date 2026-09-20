@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nix-cache-testing",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "account_id": "__CLOUDFLARE_ACCOUNT_ID__",
+  "vars": {
+    "DEFAULT_STORE_DIR": "/nix/store",
+    "DEFAULT_PRIORITY": "40",
+    "DEFAULT_WANT_MASS_QUERY": "1",
+    "DEFAULT_RETENTION_DAYS": "7",
+    "NIX_PUBLIC_SIGN_KEY": "",
+    "R2_ACCOUNT_ID": "__CLOUDFLARE_ACCOUNT_ID__",
+    "R2_BUCKET_NAME": "nix-cache-testing",
+    "DIRECT_UPLOAD_URL_TTL_SECONDS": "900"
+  },
+  "r2_buckets": [
+    {
+      "binding": "CACHE_BUCKET",
+      "bucket_name": "nix-cache-testing"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nix-cache-testing",
+      "database_id": "__D1_DATABASE_ID__",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 * * * *"]
+  }
+}

@@ -86,6 +86,7 @@ npm run build
   secrets, custom domains, and verification.
 - [Configuration and operations](docs/configuration.md)
 - [Architecture](docs/architecture.md)
+- [Remote integration tests](docs/integration-tests.md)
 - [RFC history](docs/rfc/README.md)
 
 R2 is the source of truth for cache bytes, D1 stores indexes and lifecycle

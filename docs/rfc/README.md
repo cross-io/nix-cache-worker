@@ -54,3 +54,4 @@ The RFCs currently recorded are:
 - [RFC-0014: scheduled and manual GC execution](RFC-0014-gc-scheduling-and-manual-execution.md)
 - [RFC-0015: retention group capacity](RFC-0015-retention-group-capacity.md)
 - [RFC-0016: presigned single-PUT uploads for large NARs](RFC-0016-presigned-single-put-uploads.md)
+- [RFC-0017: real Nix integration testing](RFC-0017-real-nix-integration-testing.md)
