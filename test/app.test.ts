@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { app } from "../src/app";
 import type { Bindings } from "../src/env";
+import { cleanupExpiredNarinfoReservations } from "../src/routes/narinfo";
 import { homePage } from "../src/ui/home";
 
 const testEnv = {
@@ -23,6 +24,7 @@ const testEnv = {
 beforeAll(async () => {
   const schema = `
     PRAGMA foreign_keys = ON;
+    DROP TABLE IF EXISTS artifact_version_pending_members;
     DROP TABLE IF EXISTS artifact_version_members;
     DROP TABLE IF EXISTS narinfo_refs;
     DROP TABLE IF EXISTS job_object_items;
@@ -38,9 +40,10 @@ beforeAll(async () => {
     CREATE TABLE objects (r2_key TEXT PRIMARY KEY, kind TEXT NOT NULL, etag TEXT NOT NULL, sha256 TEXT, size INTEGER NOT NULL, uploaded_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'ready', narinfo_ref_count INTEGER NOT NULL DEFAULT 0, version_member_count INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE narinfo_refs (narinfo_key TEXT PRIMARY KEY, nar_key TEXT NOT NULL, store_path TEXT, created_at TEXT NOT NULL);
     CREATE INDEX idx_narinfo_refs_nar ON narinfo_refs(nar_key);
-    CREATE TABLE artifact_versions (version_id TEXT PRIMARY KEY, package_name TEXT NOT NULL, version_name TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '{}', retention_days INTEGER, pinned INTEGER NOT NULL DEFAULT 0, registered_at TEXT NOT NULL, updated_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', UNIQUE(package_name, version_name));
+    CREATE TABLE artifact_versions (version_id TEXT PRIMARY KEY, package_name TEXT NOT NULL, version_name TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '{}', retention_days INTEGER, pinned INTEGER NOT NULL DEFAULT 0, registered_at TEXT NOT NULL, updated_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', registration_token TEXT, UNIQUE(package_name, version_name));
     CREATE TABLE artifact_version_members (version_id TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(version_id, narinfo_key));
     CREATE INDEX idx_artifact_version_members_narinfo ON artifact_version_members(narinfo_key);
+    CREATE TABLE artifact_version_pending_members (version_id TEXT NOT NULL, registration_token TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(version_id, narinfo_key));
     CREATE TABLE gc_policies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, conditions_json TEXT NOT NULL DEFAULT '[]', group_by_json TEXT NOT NULL DEFAULT '[]', last_n INTEGER, duration_days INTEGER, capacity_versions INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE jobs (id TEXT PRIMARY KEY, type TEXT NOT NULL, status TEXT NOT NULL, target_version_id TEXT, cursor INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL DEFAULT '{}', last_error TEXT, created_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE UNIQUE INDEX idx_jobs_active_delete_target ON jobs(target_version_id) WHERE type = 'delete_version' AND target_version_id IS NOT NULL AND status IN ('queued', 'running', 'failed');
@@ -51,7 +54,12 @@ beforeAll(async () => {
     INSERT INTO gc_policies (name, conditions_json, group_by_json, last_n, duration_days, capacity_versions, created_at, updated_at) VALUES ('default-package-tags', '[]', '["pkg_name","pkg_tags"]', 3, NULL, NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
   `;
   for (const statement of schema.split(";")) if (statement.trim()) await testEnv.DB.exec(statement);
-  await testEnv.CACHE_BUCKET.delete("nar/shared.nar");
+  await Promise.all([
+    "nar/shared.nar",
+    "nar/immutable.nar",
+    "nar/direct.nar",
+    "nar/bad.nar",
+  ].map((key) => testEnv.CACHE_BUCKET.delete(key)));
 });
 
 async function request(path: string, init: RequestInit = {}): Promise<{ response: Response; waitUntil: Promise<unknown>[] }> {
@@ -122,6 +130,18 @@ describe("immutable writes and direct uploads", () => {
     expect(replay.response.status).toBe(204);
     const conflict = await request("/nar/immutable.nar", { method: "PUT", headers: bearer("write-secret"), body: "other" });
     expect(conflict.response.status).toBe(409);
+    const ifMatch = await request("/nar/immutable.nar", {
+      method: "PUT",
+      headers: { ...bearer("write-secret"), "If-Match": first.response.headers.get("ETag") ?? "" },
+      body: "hello",
+    });
+    expect(ifMatch.response.status).toBe(204);
+    const nonMatchingIfNone = await request("/nar/immutable.nar", {
+      method: "PUT",
+      headers: { ...bearer("write-secret"), "If-None-Match": '"not-the-current-etag"' },
+      body: "other",
+    });
+    expect(nonMatchingIfNone.response.status).toBe(409);
     const ranged = await request("/nar/immutable.nar", { method: "HEAD", headers: { ...bearer("read-secret"), Range: "bytes=1-3" } });
     expect(ranged.response.status).toBe(206);
     expect(ranged.response.headers.get("Content-Range")).toBe("bytes 1-3/5");
@@ -139,6 +159,7 @@ describe("immutable writes and direct uploads", () => {
     expect(issuedBody).toMatchObject({ key: "nar/direct.nar", alreadyExists: false });
     expect(String(issuedBody.uploadUrl)).not.toContain("_nix_uploads");
     expect((issuedBody.uploadHeaders as Record<string, string>)["Cache-Control"]).toBe("public, max-age=31536000, immutable");
+    expect(await testEnv.DB.prepare("SELECT r2_key FROM objects WHERE r2_key = ?").bind("nar/direct.nar").first()).toBeNull();
     await testEnv.CACHE_BUCKET.put("nar/direct.nar", "hello", { httpMetadata: { contentType: "application/octet-stream", cacheControl: "public, max-age=31536000, immutable" } });
     const completed = await request("/api/uploads/complete", {
       method: "POST",
@@ -155,7 +176,7 @@ describe("immutable writes and direct uploads", () => {
     expect(replay.response.status).toBe(200);
   });
 
-  it("removes a final object after digest verification fails", async () => {
+  it("retains a mismatched final object because completion cannot prove ownership", async () => {
     const wrong = "0000000000000000000000000000000000000000000000000000000000000000";
     await testEnv.CACHE_BUCKET.put("nar/bad.nar", "wrong");
     const response = await request("/api/uploads/complete", {
@@ -164,11 +185,60 @@ describe("immutable writes and direct uploads", () => {
       body: JSON.stringify({ key: "nar/bad.nar", size: 5, sha256: wrong }),
     });
     expect(response.response.status).toBe(422);
-    expect(await testEnv.CACHE_BUCKET.head("nar/bad.nar")).toBeNull();
+    expect(await testEnv.CACHE_BUCKET.head("nar/bad.nar")).not.toBeNull();
   });
 });
 
 describe("shared NAR reference protection", () => {
+  it("rolls back a new narinfo reference when an existing unindexed object conflicts", async () => {
+    await request("/nar/narinfo-race.nar", { method: "PUT", headers: bearer("write-secret"), body: "hello" });
+    await testEnv.CACHE_BUCKET.put("narinfo-race.narinfo", narInfoBody("nar/narinfo-race.nar", "/nix/store/existing"));
+    const conflict = await request("/narinfo-race.narinfo", {
+      method: "PUT",
+      headers: bearer("write-secret"),
+      body: narInfoBody("nar/narinfo-race.nar", "/nix/store/incoming"),
+    });
+    expect(conflict.response.status).toBe(409);
+    expect(await testEnv.DB.prepare("SELECT narinfo_key FROM narinfo_refs WHERE narinfo_key = ?").bind("narinfo-race.narinfo").first()).not.toBeNull();
+    const nar = await testEnv.DB.prepare("SELECT narinfo_ref_count FROM objects WHERE r2_key = ?").bind("nar/narinfo-race.nar").first<{ narinfo_ref_count: number }>();
+    expect(nar?.narinfo_ref_count).toBe(1);
+    await testEnv.CACHE_BUCKET.delete("narinfo-race.narinfo");
+    await testEnv.DB.prepare("UPDATE objects SET uploaded_at = ? WHERE r2_key = ?").bind("2000-01-01T00:00:00.000Z", "narinfo-race.narinfo").run();
+    await cleanupExpiredNarinfoReservations(testEnv);
+    expect(await testEnv.DB.prepare("SELECT narinfo_key FROM narinfo_refs WHERE narinfo_key = ?").bind("narinfo-race.narinfo").first()).toBeNull();
+    expect(await testEnv.DB.prepare("SELECT r2_key FROM objects WHERE r2_key = ?").bind("narinfo-race.narinfo").first()).toBeNull();
+    const cleaned = await testEnv.DB.prepare("SELECT narinfo_ref_count FROM objects WHERE r2_key = ?").bind("nar/narinfo-race.nar").first<{ narinfo_ref_count: number }>();
+    expect(cleaned?.narinfo_ref_count).toBe(0);
+  });
+
+  it("does not retain a pending narinfo row when its NAR dependency is absent", async () => {
+    const missing = await request("/missing-dependency.narinfo", {
+      method: "PUT",
+      headers: bearer("write-secret"),
+      body: narInfoBody("nar/not-indexed.nar", "/nix/store/missing-dependency"),
+    });
+    expect(missing.response.status).toBe(424);
+    expect(await testEnv.DB.prepare("SELECT r2_key FROM objects WHERE r2_key = ?").bind("missing-dependency.narinfo").first()).toBeNull();
+  });
+
+  it("leaves conflicting final R2 bytes unindexed when reconciling an expired reservation", async () => {
+    await request("/nar/cleanup-expected.nar", { method: "PUT", headers: bearer("write-secret"), body: "hello" });
+    await testEnv.CACHE_BUCKET.put("cleanup-mismatch.narinfo", narInfoBody("nar/unrelated.nar", "/nix/store/unrelated"));
+    const conflict = await request("/cleanup-mismatch.narinfo", {
+      method: "PUT",
+      headers: bearer("write-secret"),
+      body: narInfoBody("nar/cleanup-expected.nar", "/nix/store/cleanup-expected"),
+    });
+    expect(conflict.response.status).toBe(409);
+    await testEnv.DB.prepare("UPDATE objects SET uploaded_at = ? WHERE r2_key = ?").bind("2000-01-01T00:00:00.000Z", "cleanup-mismatch.narinfo").run();
+    await cleanupExpiredNarinfoReservations(testEnv);
+    expect(await testEnv.CACHE_BUCKET.head("cleanup-mismatch.narinfo")).not.toBeNull();
+    expect(await testEnv.DB.prepare("SELECT r2_key FROM objects WHERE r2_key = ?").bind("cleanup-mismatch.narinfo").first()).toBeNull();
+    expect(await testEnv.DB.prepare("SELECT narinfo_key FROM narinfo_refs WHERE narinfo_key = ?").bind("cleanup-mismatch.narinfo").first()).toBeNull();
+    const nar = await testEnv.DB.prepare("SELECT narinfo_ref_count FROM objects WHERE r2_key = ?").bind("nar/cleanup-expected.nar").first<{ narinfo_ref_count: number }>();
+    expect(nar?.narinfo_ref_count).toBe(0);
+  });
+
   it("keeps a shared NAR until its last narinfo reference is removed", async () => {
     const nar = await request("/nar/shared.nar", { method: "PUT", headers: bearer("write-secret"), body: "hello" });
     expect(nar.response.status).toBe(201);

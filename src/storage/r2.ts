@@ -41,7 +41,14 @@ async function digestExisting(
   emitMetric("r2_get", { key, kind, operation: "get", status: body ? 200 : 404, bytes: body?.size ?? 0, duplicateCheck: true });
   if (!body?.body) throw new AppError("orphaned_object", "The object exists in R2 but cannot be read for index repair", 503);
   const digest = await hashStream(body.body);
-  await upsertObject(env, { key, kind: indexed?.kind ?? kind, etag: existing.httpEtag, sha256: digest.sha256, size: existing.size });
+  // A pending narinfo row is a short-lived reference reservation. Do not
+  // publish it while comparing a conflicting replay: its caller must be able
+  // to roll the reservation back without leaving a live narinfo reference.
+  if (indexed?.state !== "pending") {
+    if (!await upsertObject(env, { key, kind: indexed?.kind ?? kind, etag: existing.httpEtag, sha256: digest.sha256, size: existing.size })) {
+      throw new AppError("object_deleting", "The object is currently being deleted", 409);
+    }
+  }
   return digest.sha256;
 }
 
@@ -58,6 +65,11 @@ async function duplicateResult(
   if (incoming.sha256 !== existingSha256 || incoming.size !== existing.size) {
     throw new AppError("immutable_conflict", "An object with this key already exists with different content", 409);
   }
+  if (indexed?.state === "pending") {
+    if (!await upsertObject(env, { key, kind, etag: existing.httpEtag, sha256: existingSha256, size: existing.size })) {
+      throw new AppError("object_deleting", "The object is currently being deleted", 409);
+    }
+  }
   emitMetric("r2_put", { key, kind, status: 204, duplicate: true, bytes: 0 });
   return { object: existing, duplicate: true, sha256: incoming.sha256 };
 }
@@ -67,19 +79,38 @@ async function duplicateResult(
  * one D1 upsert. Only a conditional race or an idempotent replay needs a
  * follow-up HEAD/GET to compare the immutable bytes.
  */
-export async function putImmutableObject(env: Bindings, key: string, kind: ObjectKind, request: Request): Promise<UploadResult> {
-  if (request.headers.get("If-Match")) {
+export async function putImmutableObject(
+  env: Bindings,
+  key: string,
+  kind: ObjectKind,
+  request: Request,
+  options: { allowPending?: boolean } = {},
+): Promise<UploadResult> {
+  const indexed = await getObject(env, key);
+  if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  if (indexed?.state === "pending" && !options.allowPending) {
+    throw new AppError("object_uploading", "The object is currently being uploaded", 409);
+  }
+
+  const ifMatch = request.headers.get("If-Match");
+  const ifNoneMatch = request.headers.get("If-None-Match");
+  if (ifMatch) {
     const existing = await env.CACHE_BUCKET.head(key);
-    if (!existing || !strongEtagMatches(request.headers.get("If-Match"), existing.httpEtag)) {
+    if (!existing || !strongEtagMatches(ifMatch, existing.httpEtag)) {
       throw new AppError("precondition_failed", "If-Match does not match the existing object", 412);
     }
-    throw new AppError("immutable_conflict", "An object with this key already exists", 409);
+    if (ifNoneMatch && etagMatches(ifNoneMatch, existing.httpEtag)) {
+      throw new AppError("precondition_failed", "If-None-Match matches the existing object", 412);
+    }
+    if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
+    const incoming = await hashStream(request.body);
+    return duplicateResult(env, key, kind, incoming, existing, indexed);
   }
 
   if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
   const [hashBody, uploadBody] = request.body.tee();
   const hashPromise = hashStream(hashBody);
-  const onlyIf: R2Conditional = { etagDoesNotMatch: request.headers.get("If-None-Match") ?? "*" };
+  const onlyIf: R2Conditional = { etagDoesNotMatch: "*" };
   const object = await env.CACHE_BUCKET.put(key, uploadBody, {
     onlyIf,
     httpMetadata: httpMetadataFor(kind),
@@ -88,14 +119,18 @@ export async function putImmutableObject(env: Bindings, key: string, kind: Objec
   if (object) {
     emitMetric("r2_put", { key, kind, status: 201, duplicate: false, bytes: incoming.size });
     emitMetric("upload_bytes", { key, kind, status: 201, bytes: incoming.size });
-    await upsertObject(env, { key, kind, etag: object.httpEtag, sha256: incoming.sha256, size: incoming.size });
+    if (!await upsertObject(env, { key, kind, etag: object.httpEtag, sha256: incoming.sha256, size: incoming.size })) {
+      throw new AppError("object_deleting", "The object is currently being deleted", 409);
+    }
     return { object, duplicate: false, sha256: incoming.sha256 };
   }
 
   const existing = await env.CACHE_BUCKET.head(key);
   emitMetric("r2_get", { key, kind, operation: "head", status: existing ? 200 : 404, bytes: 0, duplicateCheck: true });
   if (!existing) throw new AppError("upload_race", "The conditional upload failed without an observable object", 503);
-  if (request.headers.has("If-None-Match")) throw new AppError("precondition_failed", "The object already exists", 412);
+  if (ifNoneMatch && etagMatches(ifNoneMatch, existing.httpEtag)) {
+    throw new AppError("precondition_failed", "If-None-Match matches the existing object", 412);
+  }
   return duplicateResult(env, key, kind, incoming, existing, await getObject(env, key));
 }
 

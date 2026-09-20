@@ -29,6 +29,10 @@ jobs:
       ADMIN_TOKEN: ${{ secrets.NIX_CACHE_TESTING_ADMIN_TOKEN }}
       R2_S3_ACCESS_KEY_ID: ${{ secrets.R2_S3_ACCESS_KEY_ID }}
       R2_S3_SECRET_ACCESS_KEY: ${{ secrets.R2_S3_SECRET_ACCESS_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_S3_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_EC2_METADATA_DISABLED: "true"
       NIX_CACHE_TESTING_WRITE_TOKEN: ${{ secrets.NIX_CACHE_TESTING_WRITE_TOKEN }}
       NIX_CACHE_TESTING_ADMIN_TOKEN: ${{ secrets.NIX_CACHE_TESTING_ADMIN_TOKEN }}
     steps:
@@ -75,13 +79,9 @@ jobs:
       - name: Reset isolated R2 and D1 state
         run: |
           set -euo pipefail
-          npx wrangler r2 object list nix-cache-testing --remote --json --config wrangler.integration.generated.jsonc \
-            | jq -r '.objects[]?.key // empty' \
-            | while IFS= read -r object_key; do
-                [[ -n "$object_key" ]] || continue
-                npx wrangler r2 object delete "nix-cache-testing/$object_key" --remote --config wrangler.integration.generated.jsonc
-              done
-          npx wrangler d1 execute nix-cache-testing --remote --config wrangler.integration.generated.jsonc --command "PRAGMA foreign_keys=OFF; DROP TABLE IF EXISTS artifact_version_members; DROP TABLE IF EXISTS narinfo_refs; DROP TABLE IF EXISTS job_object_items; DROP TABLE IF EXISTS gc_scan_versions; DROP TABLE IF EXISTS gc_policy_matches; DROP TABLE IF EXISTS delete_job_nars; DROP TABLE IF EXISTS delete_job_narinfos; DROP TABLE IF EXISTS upload_sessions; DROP TABLE IF EXISTS write_claims; DROP TABLE IF EXISTS jobs; DROP TABLE IF EXISTS artifact_versions; DROP TABLE IF EXISTS artifact_packages; DROP TABLE IF EXISTS objects; DROP TABLE IF EXISTS gc_policies; DROP TABLE IF EXISTS settings; DROP TABLE IF EXISTS audit_log; DELETE FROM d1_migrations;" \
+          aws s3 rm s3://nix-cache-testing --recursive --only-show-errors \
+            --endpoint-url "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          npx wrangler d1 execute nix-cache-testing --remote --config wrangler.integration.generated.jsonc --command "PRAGMA foreign_keys=OFF; DROP TABLE IF EXISTS artifact_version_pending_members; DROP TABLE IF EXISTS artifact_version_members; DROP TABLE IF EXISTS narinfo_refs; DROP TABLE IF EXISTS job_object_items; DROP TABLE IF EXISTS gc_scan_versions; DROP TABLE IF EXISTS gc_policy_matches; DROP TABLE IF EXISTS delete_job_nars; DROP TABLE IF EXISTS delete_job_narinfos; DROP TABLE IF EXISTS upload_sessions; DROP TABLE IF EXISTS write_claims; DROP TABLE IF EXISTS jobs; DROP TABLE IF EXISTS artifact_versions; DROP TABLE IF EXISTS artifact_packages; DROP TABLE IF EXISTS objects; DROP TABLE IF EXISTS gc_policies; DROP TABLE IF EXISTS settings; DROP TABLE IF EXISTS audit_log; DELETE FROM d1_migrations;" \
             >/dev/null
 
       - name: Apply testing D1 migrations

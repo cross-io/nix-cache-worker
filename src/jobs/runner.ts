@@ -87,7 +87,7 @@ async function protectedVersionIds(env: Bindings, jobId: string, versions: Versi
     const placeholders = batch.map(() => "?").join(",");
     const result = await env.DB.prepare(
       `SELECT DISTINCT version_id FROM gc_policy_matches
-       WHERE job_id = ? AND keep_count IS NOT NULL AND version_id IN (${placeholders})`,
+       WHERE job_id = ? AND keep_count > 0 AND version_id IN (${placeholders})`,
     ).bind(jobId, ...batch.map((row) => row.version_id)).all<{ version_id: string }>();
     for (const row of result.results) protectedIds.add(row.version_id);
   }
@@ -233,7 +233,8 @@ async function detachVersionMembers(env: Bindings, jobId: string, versionId: str
 async function markObjectDeleting(env: Bindings, item: JobObjectRow): Promise<boolean> {
   const guard = item.object_kind === "narinfo"
     ? `kind = 'narinfo' AND version_member_count = 0
-       AND NOT EXISTS (SELECT 1 FROM artifact_version_members m WHERE m.narinfo_key = objects.r2_key)`
+       AND NOT EXISTS (SELECT 1 FROM artifact_version_members m WHERE m.narinfo_key = objects.r2_key)
+       AND NOT EXISTS (SELECT 1 FROM narinfo_refs r WHERE r.narinfo_key = objects.r2_key)`
     : "kind = 'nar' AND narinfo_ref_count = 0";
   const result = await env.DB.prepare(
     `UPDATE objects SET state = 'deleting'

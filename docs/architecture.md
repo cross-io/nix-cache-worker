@@ -66,8 +66,9 @@ Large NARs use a stateless final-key flow:
    the object, and upserts `objects` after verification.
 
 There are no staging keys, upload sessions, staging cleanup jobs, or
-`_nix_uploads/` objects in the new deployment. A wrong digest or size deletes
-the final object before returning an error.
+`_nix_uploads/` objects in the new deployment. A wrong digest or size leaves
+the final object untouched because completion cannot prove ownership of bytes
+written through a valid presigned URL; operators can remove that unindexed key.
 
 ## D1 lifecycle model
 

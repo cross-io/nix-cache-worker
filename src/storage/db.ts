@@ -29,6 +29,7 @@ export type VersionRow = {
   registered_at: string;
   updated_at: string;
   state: string;
+  registration_token?: string | null;
 };
 
 export function now(): string {
@@ -46,14 +47,16 @@ export async function upsertObject(env: Bindings, object: {
   sha256: string | null;
   size: number;
   state?: string;
-}): Promise<void> {
+}): Promise<boolean> {
   const timestamp = now();
-  await env.DB.prepare(
+  const result = await env.DB.prepare(
     `INSERT INTO objects (r2_key, kind, etag, sha256, size, uploaded_at, state, narinfo_ref_count, version_member_count)
      VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)
      ON CONFLICT(r2_key) DO UPDATE SET etag = excluded.etag, sha256 = excluded.sha256,
-       size = excluded.size, state = excluded.state`,
+       size = excluded.size, state = excluded.state
+     WHERE objects.state != 'deleting'`,
   ).bind(object.key, object.kind, object.etag, object.sha256, object.size, timestamp, object.state ?? "ready").run();
+  return result.meta.changes === 1;
 }
 
 export async function getVersion(env: Bindings, packageName: string, versionName: string): Promise<VersionRow | null> {

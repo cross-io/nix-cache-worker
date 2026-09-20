@@ -134,8 +134,10 @@ curl --fail-with-body -X POST https://cache.example.org/api/uploads/complete \
 ```
 
 The first response supplies the presigned PUT URL and required headers. PUT the
-file to that URL before calling completion. A wrong digest or size is removed
-automatically. There are no staging sessions to expire or clean up.
+file to that URL before calling completion. A wrong digest or size is retained
+because a stateless completion request cannot prove it owns the final bytes;
+remove the resulting unindexed immutable key manually if necessary. There are
+no staging sessions to expire or clean up.
 
 ## Operations and recovery
 

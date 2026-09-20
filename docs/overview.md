@@ -56,8 +56,10 @@ Large-NAR control-plane endpoints:
 `POST /api/uploads` accepts `{ "key", "size", "sha256" }` and returns a
 presigned PUT for the final key plus `uploadHeaders` and `alreadyExists`.
 After the direct PUT, call `/api/uploads/complete` with the same JSON body.
-Completion performs R2 `HEAD` and `GET` verification, repairs the D1 index,
-and deletes a wrong final object. There are no upload IDs, staging keys, or
+Completion performs R2 `HEAD` and `GET` verification and repairs the D1 index.
+A wrong final object is retained because a stateless completion call cannot
+prove it owns the bytes; an operator can remove that unindexed immutable key.
+There are no upload IDs, staging keys, or
 session cleanup jobs.
 
 ### HTTP behavior

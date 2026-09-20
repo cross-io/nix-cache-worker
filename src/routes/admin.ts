@@ -293,6 +293,7 @@ async function packageResponse(
 }
 
 adminRoutes.get("/api/admin/overview", async (c) => {
+  const defaultRetentionDays = await fallbackRetention(c.env);
   const [versions, objects, unclassified] = await Promise.all([
     c.env.DB.prepare(
       `SELECT COUNT(*) AS version_count,
@@ -329,6 +330,7 @@ adminRoutes.get("/api/admin/overview", async (c) => {
     indexedBytes: Number(objects?.bytes ?? 0),
     unclassifiedObjects: Number(unclassified?.object_count ?? 0),
     unclassifiedBytes: Number(unclassified?.bytes ?? 0),
+    defaultRetentionDays,
   });
 });
 

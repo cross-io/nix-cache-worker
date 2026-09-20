@@ -74,12 +74,11 @@ The test makes two Nix store entries and exercises both publisher interfaces:
    temporary version. `nix store cat --store` downloads and verifies the large
    target file from the Worker.
 
-The small read remains anonymous. Before the large read, the script gives real
-`nix store cat` a separate mode-0600 netrc with an intentionally invalid token
-and requires that request to fail. It then reads the same target with another
-mode-0600 netrc containing `NIX_CACHE_TESTING_READ_TOKEN`. This proves Nix
-sends its Basic credential and that the configured read secret is usable: an
-invalid supplied credential is rejected before the public-read route can run.
+The script first confirms that an anonymous cache request is rejected. It then
+uses a mode-0600 read netrc for both Nix readbacks, and gives real `nix store
+cat` a separate mode-0600 netrc with an intentionally invalid token that must
+fail. This proves Nix sends its Basic credential and that the configured read
+secret is usable.
 
 The client-managed large case intentionally uses the direct-upload protocol:
 stock `nix copy --to` cannot discover or use this API, and routing its 100+ MiB

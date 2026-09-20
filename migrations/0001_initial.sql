@@ -13,7 +13,7 @@ CREATE TABLE objects (
   sha256 TEXT,
   size INTEGER NOT NULL CHECK (size >= 0),
   uploaded_at TEXT NOT NULL,
-  state TEXT NOT NULL DEFAULT 'ready' CHECK (state IN ('ready', 'orphaned', 'deleting', 'deleted')),
+  state TEXT NOT NULL DEFAULT 'ready' CHECK (state IN ('pending', 'ready', 'orphaned', 'deleting', 'deleted')),
   narinfo_ref_count INTEGER NOT NULL DEFAULT 0 CHECK (narinfo_ref_count >= 0),
   version_member_count INTEGER NOT NULL DEFAULT 0 CHECK (version_member_count >= 0)
 );
@@ -40,6 +40,7 @@ CREATE TABLE artifact_versions (
   registered_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('registering', 'active', 'deleting', 'deleted')),
+  registration_token TEXT,
   UNIQUE(package_name, version_name)
 );
 
@@ -48,11 +49,21 @@ CREATE INDEX idx_artifact_versions_package_registered
 
 CREATE TABLE artifact_version_members (
   version_id TEXT NOT NULL REFERENCES artifact_versions(version_id) ON DELETE CASCADE,
-  narinfo_key TEXT NOT NULL REFERENCES narinfo_refs(narinfo_key),
+  narinfo_key TEXT NOT NULL,
   PRIMARY KEY (version_id, narinfo_key)
 );
 
 CREATE INDEX idx_artifact_version_members_narinfo ON artifact_version_members(narinfo_key);
+
+CREATE TABLE artifact_version_pending_members (
+  version_id TEXT NOT NULL REFERENCES artifact_versions(version_id) ON DELETE CASCADE,
+  registration_token TEXT NOT NULL,
+  narinfo_key TEXT NOT NULL,
+  PRIMARY KEY (version_id, narinfo_key)
+);
+
+CREATE INDEX idx_artifact_version_pending_members_token
+  ON artifact_version_pending_members(version_id, registration_token);
 
 CREATE TABLE gc_policies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

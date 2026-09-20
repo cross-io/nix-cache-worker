@@ -1,9 +1,13 @@
 # RFC-0019: direct large-NAR publishing and removal of Worker multipart
 
-- Status: Implemented
+- Status: Superseded by RFC-0021
 - Date: 2026-09-20
 
 ## Context
+
+RFC-0021 replaces the session and staging terminology in this RFC with a
+stateless final-key presigned PUT and verification flow. This RFC remains
+historical context only.
 
 The Worker previously implemented R2 multipart uploads for standard Nix HTTP
 PUT requests above 8 MiB. That does not solve the Worker inbound request-body

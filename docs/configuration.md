@@ -82,6 +82,7 @@ Worker response and run an R2 object upload, for example:
 printf 'StoreDir: %s\nWantMassQuery: %s\nPriority: %s\n' \
   "$DEFAULT_STORE_DIR" "$DEFAULT_WANT_MASS_QUERY" "$DEFAULT_PRIORITY" > /tmp/nix-cache-info
 npx wrangler r2 object put "$R2_BUCKET_NAME/nix-cache-info" \
+  --remote \
   --file /tmp/nix-cache-info \
   --content-type 'text/plain; charset=utf-8' \
   --cache-control 'public, max-age=31536000, immutable'
@@ -127,9 +128,12 @@ Content-Type: application/json
 ```
 
 Completion performs one R2 `HEAD` and one R2 `GET` to calculate SHA-256. A
-wrong size or digest deletes the final object. Completion is idempotent after
-successful verification. The bundled `bin/nix-cache-upload` client uses this
-flow and publishes narinfo only after completion.
+wrong size or digest leaves the final key untouched: a stateless completion
+request cannot prove it owns bytes that may have been written by another valid
+presigned PUT. The immutable key remains unavailable for completion with a
+different digest and can be cleaned up by an operator if needed. Completion is
+idempotent after successful verification. The bundled `bin/nix-cache-upload`
+client uses this flow and publishes narinfo only after completion.
 
 ## Lifecycle and retention
 

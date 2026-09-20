@@ -66,14 +66,23 @@ printf 'machine %s login nix password intentionally-invalid-read-token\n' "$cach
 chmod 600 "$invalid_read_netrc_file"
 
 retry_cache_request() {
-  local attempt output response_status response_file
+  local attempt output response_status response_file response_headers head_request=0
+  if [[ "${1:-}" == "--head" ]]; then
+    head_request=1
+    shift
+  fi
   response_file="$temporary_directory/cache-response"
+  response_headers="$temporary_directory/cache-response-headers"
   for attempt in $(seq 1 15); do
-    if ! response_status="$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' "$@")"; then
+    if (( head_request )); then
+      if ! response_status="$(curl --silent --show-error --location --head --dump-header "$response_headers" --output /dev/null --write-out '%{http_code}' "$@")"; then
+        response_status="000"
+      fi
+    elif ! response_status="$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' "$@")"; then
       response_status="000"
     fi
     if [[ "$response_status" =~ ^2[0-9][0-9]$ ]]; then
-      output="$(<"$response_file")"
+      if (( head_request )); then output="$(<"$response_headers")"; else output="$(<"$response_file")"; fi
       printf '%s' "$output"
       return 0
     fi
@@ -151,7 +160,8 @@ assert_nix_store_cat_rejects_invalid_credentials() {
   fi
 }
 
-cache_info="$(retry_cache_request "$base_url/nix-cache-info")"
+retry_cache_status 401 "$base_url/nix-cache-info"
+cache_info="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/nix-cache-info")"
 if ! grep --quiet '^StoreDir: /nix/store$' <<<"$cache_info"; then
   printf 'NIX_CACHE_TESTING_URL did not serve the expected Nix cache information\n' >&2
   exit 1
@@ -195,18 +205,18 @@ printf 'Uploading the sub-50 MiB NAR with nix copy...\n'
 nix --option netrc-file "$netrc_file" copy --to "$base_url" "$small_store_path"
 
 small_narinfo_key="$(basename "$small_store_path").narinfo"
-small_nar_key="$(retry_cache_request "$base_url/$small_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
+small_nar_key="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/$small_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
 if [[ -z "$small_nar_key" ]]; then
   printf 'The small Nix upload did not publish a usable narinfo\n' >&2
   exit 1
 fi
-small_nar_size="$(retry_cache_request --head "$base_url/$small_nar_key" | awk 'BEGIN { IGNORECASE = 1 } /^content-length:/ { print $2 }' | tr -d '\r' | tail -n 1)"
+small_nar_size="$(retry_cache_request --head --netrc-file "$read_netrc_file" "$base_url/$small_nar_key" | awk 'BEGIN { IGNORECASE = 1 } /^content-length:/ { print $2 }' | tr -d '\r' | tail -n 1)"
 if [[ -z "$small_nar_size" || "$small_nar_size" -ge $((50 * 1024 * 1024)) ]]; then
   printf 'The small NAR did not stay below 50 MiB\n' >&2
   exit 1
 fi
 
-small_downloaded_sha256="$(retry_nix_store_cat_sha256 "$small_store_path")"
+small_downloaded_sha256="$(retry_nix_store_cat_sha256 "$small_store_path" "$read_netrc_file")"
 if [[ "$small_downloaded_sha256" != "$small_expected_sha256" ]]; then
   printf 'Nix did not retrieve the expected small payload\n' >&2
   exit 1
@@ -229,22 +239,22 @@ if [[ "$largest_client_nar_size" -le $((100 * 1024 * 1024)) ]]; then
 fi
 
 large_narinfo_key="$(basename "$large_store_path").narinfo"
-large_nar_key="$(retry_cache_request "$base_url/$large_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
+large_nar_key="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/$large_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
 if [[ -z "$large_nar_key" ]]; then
   printf 'nix-cache-upload did not publish the large narinfo\n' >&2
   exit 1
 fi
 
-large_nar_etag="$(retry_cache_request --head "$base_url/$large_nar_key" | awk 'BEGIN { IGNORECASE = 1 } /^etag:/ { print $2 }' | tr -d '\r' | tail -n 1)"
+large_nar_etag="$(retry_cache_request --head --netrc-file "$read_netrc_file" "$base_url/$large_nar_key" | awk 'BEGIN { IGNORECASE = 1 } /^etag:/ { print $2 }' | tr -d '\r' | tail -n 1)"
 if [[ -z "$large_nar_etag" ]]; then
   printf 'The direct large-NAR read did not return an ETag\n' >&2
   exit 1
 fi
-retry_direct_r2_redirect "$base_url/$large_nar_key"
-retry_direct_r2_redirect --head "$base_url/$large_nar_key"
-retry_cache_status 206 --range 0-0 "$base_url/$large_nar_key"
-retry_cache_status 304 --header "If-None-Match: $large_nar_etag" "$base_url/$large_nar_key"
-retry_cache_status 412 --header 'If-Match: "never-match"' "$base_url/$large_nar_key"
+retry_direct_r2_redirect --netrc-file "$read_netrc_file" "$base_url/$large_nar_key"
+retry_direct_r2_redirect --head --netrc-file "$read_netrc_file" "$base_url/$large_nar_key"
+retry_cache_status 206 --netrc-file "$read_netrc_file" --range 0-0 "$base_url/$large_nar_key"
+retry_cache_status 304 --netrc-file "$read_netrc_file" --header "If-None-Match: $large_nar_etag" "$base_url/$large_nar_key"
+retry_cache_status 412 --netrc-file "$read_netrc_file" --header 'If-Match: "never-match"' "$base_url/$large_nar_key"
 
 assert_nix_store_cat_rejects_invalid_credentials "$large_store_path" "$invalid_read_netrc_file"
 large_downloaded_sha256="$(retry_nix_store_cat_sha256 "$large_store_path" "$read_netrc_file")"

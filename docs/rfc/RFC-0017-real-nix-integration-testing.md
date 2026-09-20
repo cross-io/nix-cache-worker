@@ -40,22 +40,22 @@ the deployed HTTP cache:
 1. The small item is uploaded with normal `nix copy --to` and read back by Nix.
 2. The zero-compile upload client generates canonical file-cache NARs and
    narinfos for both items, verifies that one NAR exceeds 100 MiB, completes
-   their direct-upload sessions, publishes narinfos, and registers the test
+   final-key direct-upload verification, publishes narinfos, and registers the test
    version. Nix then reads the large target file back from the Worker with a
    separate read-token netrc.
 
 After the read checks, the script registers both narinfos as one temporary
 version and requests its confirmed admin deletion. It polls the deletion job to
 completion so successful runs do not retain their random final large NAR in R2.
-The test template reduces the direct-upload URL lifetime to 15 minutes and
-runs cleanup hourly. The staging object remains until expiry and cleanup because
-deleting it earlier would make its still-valid signed `If-None-Match: *` URL
-reusable; its retention is therefore bounded to roughly 75 minutes.
+The test template reduces the direct-upload URL lifetime to 15 minutes. Each
+run resets the isolated D1 and R2 resources before deployment; the final-key
+flow has no staging object or session cleanup lifecycle.
 
 The test uses `require-sigs = false` only because the fixture's generated
 narinfos are unsigned. It does not relax the Worker authorization boundary:
-the small read remains anonymous, while real Nix first proves an invalid
-read-token netrc fails and then retrieves the large target using READ_TOKEN.
+the script first proves anonymous cache access is rejected, then real Nix
+proves an invalid read-token netrc fails and retrieves both targets using
+READ_TOKEN.
 The test configuration enables the presigned read mode from RFC-0018, so Nix
 also proves that it can retrieve both fixtures after a Worker redirect to R2.
 
@@ -75,10 +75,7 @@ also proves that it can retrieve both fixtures after a Worker redirect to R2.
 - Before publishing, the script records deterministic final object keys from a
   local file cache. A failed or cancelled run performs best-effort cleanup of
   only those unreferenced final objects and D1 rows. It removes an object index
-  only after R2 confirms the matching deletion; staging objects remain for safe
-  expiry cleanup.
-- The direct-upload staging object remains present until its presigned URL
-  expires, then the isolated Worker cleans it within the next hourly Cron run.
+  only after R2 confirms the matching deletion.
 
 ## Compatibility and migration
 
@@ -102,13 +99,13 @@ the application's existing migration chain.
 - The integration script confirms that its direct large-NAR GET and HEAD first
   receive a signed R2 redirect without emitting the bearer URL.
 - Successful tests complete their authorized deletion job and remove final test
-  NARs. Staging cleanup is deferred safely until URL expiry and the next hourly
-  Cron run.
+  NARs; no staging cleanup is required.
 - Failed or cancelled tests make a best-effort removal of their pre-recorded,
-  unreferenced final object keys without deleting staging objects early.
+  unreferenced final object keys.
 - HUP, INT, and TERM are converted to nonzero exits before the EXIT trap runs,
   so GitHub Actions cancellation uses that failed-run cleanup path.
-- One Nix read uses the configured READ_TOKEN and one remains anonymous.
+- The script verifies anonymous reads are rejected and uses READ_TOKEN for both
+  Nix readbacks.
 - The workflow does not run for Markdown-only pushes to `master`.
 
 ## Implementation notes

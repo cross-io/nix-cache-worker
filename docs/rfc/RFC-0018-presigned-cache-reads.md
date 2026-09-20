@@ -1,9 +1,13 @@
 # RFC-0018: presigned cache reads
 
-- Status: Implemented
+- Status: Superseded by RFC-0021
 - Date: 2026-09-20
 
 ## Context
+
+RFC-0021 replaces the optional, metadata-sensitive redirect mode with a fixed
+best-effort read path. This RFC remains historical context only; its fallback,
+TTL, and metadata guidance is no longer operational.
 
 R2 is the source of truth for immutable cache bytes, but serving every NAR and
 narinfo through the Worker makes the Worker a data-plane hop. A short-lived R2

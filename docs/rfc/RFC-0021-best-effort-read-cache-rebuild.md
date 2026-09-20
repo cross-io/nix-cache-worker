@@ -54,7 +54,9 @@ conditional immutable PUT and `public, max-age=31536000, immutable` metadata.
 The large-NAR API issues a presigned PUT for the final key and uses a separate
 completion call containing the key, size, and SHA-256. Completion performs one
 R2 `HEAD`, one R2 `GET` for verification, and then repairs or inserts the D1
-index. A digest mismatch removes the erroneous final object.
+index. A digest mismatch leaves the key untouched because a stateless caller
+cannot prove it owns bytes written through a valid presigned URL; an operator
+may clean up that unindexed key.
 
 ### D1 and shared references
 
@@ -67,6 +69,12 @@ Deletion may mark a NAR for R2 removal only when it is ready and its
 `narinfo_ref_count` is zero. R2 deletion and final D1 cleanup are independent,
 bounded, retryable job steps. A stale CDN response does not affect these
 database invariants.
+
+A failed narinfo PUT retains a D1 reference reservation so a concurrent writer
+cannot detach a shared NAR. After 15 minutes it is eligible for reconciliation
+by the next scheduled maintenance run; if final R2 bytes are present, that run
+finishes their ready index instead. The grace period is a safety lower bound,
+not a promise of immediate cleanup between the normal eight-hour GC runs.
 
 ### Retention and jobs
 
