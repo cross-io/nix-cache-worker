@@ -27,6 +27,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Prepare local Wrangler test configuration
+        run: cp wrangler.jsonc.example wrangler.jsonc
+
       - name: Typecheck
         run: npm run typecheck
 
