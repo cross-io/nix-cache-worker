@@ -10,7 +10,7 @@ It supports:
 
 - standard `nix copy --to` and `nix copy --from` workflows;
 - public cache reads with authenticated writes;
-- direct-to-R2 single-PUT uploads for NARs larger than the Worker request limit;
+- a zero-compile Nix publishing client with direct-to-R2 NAR uploads;
 - optional presigned R2 redirects for cache-object reads;
 - package and build-version organization with tags;
 - retention policies, pins, and bounded garbage collection;
@@ -54,11 +54,18 @@ for the deployed origin.
 The admin console is available at `/admin`. It manages package versions,
 retention rules, pins, garbage collection, and persistent deletion jobs.
 
-For NARs larger than the Worker request-body limit, use the authenticated
-direct-upload API documented in [`docs/configuration.md`](docs/configuration.md).
-The client uploads the file directly to an R2 presigned URL, then asks the
-Worker to verify and finalize it. This is a CI upload path; it does not change
-the standard `nix copy --to` protocol.
+For CI publishing, use [`bin/nix-cache-upload`](bin/nix-cache-upload). It
+exports a standard local Nix file cache, sends every NAR directly to R2 through
+an authenticated presigned session, publishes narinfo only after completion,
+and registers the requested package/version. This does not change the standard
+`nix copy --to` protocol.
+
+```bash
+NIX_CACHE_WRITE_TOKEN=... bin/nix-cache-upload \
+  --to https://cache.example.org \
+  --package example --version ci-123 --tag channel=main \
+  nixpkgs#hello
+```
 
 Deployments may also set `DIRECT_DOWNLOAD_URL_TTL_SECONDS` to redirect
 supported NAR and narinfo GET/HEAD requests to short-lived R2 URLs. Stock Nix

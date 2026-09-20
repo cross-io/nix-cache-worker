@@ -57,3 +57,4 @@ The RFCs currently recorded are:
 - [RFC-0017: real Nix integration testing](RFC-0017-real-nix-integration-testing.md)
 - [RFC-0018: presigned cache reads](RFC-0018-presigned-cache-reads.md)
 - [RFC-0019: direct large-NAR publishing and removal of Worker multipart](RFC-0019-direct-large-nar-publishing.md)
+- [RFC-0020: zero-compile Nix upload client](RFC-0020-zero-compile-nix-upload-client.md)

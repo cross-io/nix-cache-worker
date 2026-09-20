@@ -60,30 +60,31 @@ a Markdown-only push does not trigger it; a push that includes code and
 Markdown still runs the test. A concurrency group cancels an older in-flight
 test deployment before a newer push can reconfigure the shared Worker.
 
-The test makes two independent cache entries:
+The test makes two Nix store entries and exercises both publisher interfaces:
 
 1. An 8 MiB random payload is added to the real Nix store. `nix copy --to`
    uploads it through the normal HTTP cache protocol, and `nix store cat --store`
    retrieves the target file from the deployed Worker and verifies its SHA-256.
-2. A 128 MiB random payload is added to the real Nix store. Nix writes a local
-   file cache to produce its canonical compressed NAR and narinfo. The script
-   requires that compressed NAR to exceed 100 MiB, uploads it through
-   `POST /api/uploads`, the presigned R2 PUT, and the completion endpoint, then
-   sends the Nix-generated narinfo with the normal authenticated PUT. `nix store
-   cat --store` downloads and verifies the target file from the Worker.
+2. A 128 MiB random payload is added to the real Nix store. The checked-in
+   `bin/nix-cache-upload` client receives both paths in one invocation. It
+   creates its own local file cache, confirms one generated NAR is over 100 MiB,
+   uploads NARs through `POST /api/uploads` and presigned R2 PUTs, publishes the
+   Nix-generated narinfos through normal authenticated PUTs, and registers the
+   temporary version. `nix store cat --store` downloads and verifies the large
+   target file from the Worker.
 
-The large case intentionally uses the direct-upload protocol: stock `nix copy
---to` cannot discover or use this API, and routing its 100+ MiB request through
-the Worker would not validate the purpose of the feature. The testing
+The client-managed large case intentionally uses the direct-upload protocol:
+stock `nix copy --to` cannot discover or use this API, and routing its 100+ MiB
+request through the Worker would not validate the purpose of the feature. The testing
 configuration also enables five-minute presigned R2 read redirects, so both
 Nix readback checks verify that Nix follows the direct data-plane URL. The
 large-object case also verifies the redirected R2 Range, `If-None-Match`, and
 `If-Match` responses before Nix reads the payload. It first asserts that both
 GET and HEAD return a signed `307` R2 URL without logging that bearer URL.
 
-After both reads succeed, the script registers the two narinfos as a temporary
-test version and uses the admin deletion job to remove the version, narinfos,
-and unshared final NARs. A direct-upload staging object cannot be removed until
+After both reads succeed, the client has registered its narinfos as a temporary
+test version and the script uses the admin deletion job to remove the version,
+narinfos, and unshared final NARs. A direct-upload staging object cannot be removed until
 its signed URL expires: deleting it earlier would let a holder of that URL reuse
 the signed `If-None-Match: *` PUT. The isolated test configuration therefore
 uses a 15-minute direct-upload URL and an hourly Cron cleanup, bounding staging

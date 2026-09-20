@@ -29,6 +29,12 @@ returned R2 presigned URL, and then calls the completion endpoint. The Worker
 verifies the staged bytes before making the final immutable cache object
 visible and indexing it in D1.
 
+`bin/nix-cache-upload` is the supported zero-compile CI wrapper for that flow.
+It exports a complete local file cache from one or more Nix installables, sends
+all of its NARs through direct upload sessions, publishes narinfos only after
+completion, and registers an explicit package/version. Stock `nix copy --to`
+remains the compatibility publisher for ordinary Worker PUTs.
+
 ## Cache API
 
 The cache uses the conventional Nix binary-cache paths.

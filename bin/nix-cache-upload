@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+
+# Publish a Nix closure through the cache's direct-to-R2 upload protocol.
+# This script deliberately targets Bash 3.2 so it also works with the system
+# Bash shipped by older macOS releases.
+
+set -euo pipefail
+
+readonly PROGRAM_NAME="nix-cache-upload"
+readonly MAX_SINGLE_PUT_BYTES=$((5 * 1024 * 1024 * 1024))
+readonly DEFAULT_RETRIES=3
+
+cache_url=""
+package_name=""
+version_name=""
+token_file=""
+retry_count="$DEFAULT_RETRIES"
+retention_days=""
+tag_pairs=()
+installables=()
+temporary_directory=""
+file_cache=""
+curl_config=""
+success=false
+
+usage() {
+  cat <<'EOF'
+Usage:
+  nix-cache-upload --to https://cache.example.org --package NAME --version NAME [options] INSTALLABLE...
+
+Publish the complete closure of one or more Nix installables. NARs are uploaded
+directly to R2 through presigned URLs; narinfo metadata is published only after
+every referenced NAR has completed and is indexed.
+
+Required:
+  --to URL                 HTTPS cache origin without a path
+  --package NAME           Package name for version registration
+  --version NAME           Opaque version name for version registration
+
+Options:
+  --token-file PATH        Read the write token from PATH (overrides NIX_CACHE_WRITE_TOKEN)
+  --tag KEY=VALUE          Add a version tag; may be specified up to 64 times
+  --retention-days DAYS    Set the version retention override (0 through 36500)
+  --retries COUNT          Retries after the first request attempt (default: 3)
+  --help                   Show this help text
+
+The write token is read from NIX_CACHE_WRITE_TOKEN when --token-file is absent.
+Use -- before an installable when it could otherwise look like an option.
+EOF
+}
+
+die() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+  exit 1
+}
+
+cleanup() {
+  local status="$?"
+  if [[ -n "$temporary_directory" && -d "$temporary_directory" ]]; then
+    if [[ "$status" -eq 0 && "$success" == true ]]; then
+      rm -rf -- "$temporary_directory"
+    else
+      printf '%s: upload did not finish; temporary cache retained at %s\n' "$PROGRAM_NAME" "$temporary_directory" >&2
+    fi
+  fi
+  exit "$status"
+}
+
+trap cleanup EXIT
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$ ]]
+}
+
+valid_tag() {
+  local pair="$1"
+  local key="${pair%%=*}"
+  local value="${pair#*=}"
+  [[ "$pair" == *=* ]] && [[ "$key" =~ ^[A-Za-z0-9._~-]{1,64}$ ]] && [[ ${#value} -le 256 ]]
+}
+
+retryable_status() {
+  local status="$1"
+  [[ "$status" == "000" || "$status" == "408" || "$status" == "429" || "$status" =~ ^5[0-9][0-9]$ ]]
+}
+
+retry_delay() {
+  local attempt="$1"
+  local seconds=$((1 << attempt))
+  if [[ "$seconds" -gt 8 ]]; then seconds=8; fi
+  sleep "$seconds"
+}
+
+curl_escape() {
+  local value="$1"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "unsafe value returned for curl configuration"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "$value"
+}
+
+curl_config_line() {
+  local config_file="$1"
+  local key="$2"
+  local value="$3"
+  printf '%s = "%s"\n' "$key" "$(curl_escape "$value")" >> "$config_file"
+}
+
+curl_status() {
+  local response_file="$1"
+  shift
+  local status
+  status="$(curl "$@" --output "$response_file" --write-out '%{http_code}' 2>/dev/null)" || status="000"
+  if [[ ! "$status" =~ ^[0-9]{3}$ ]]; then status="000"; fi
+  printf '%s' "$status"
+}
+
+api_request() {
+  local method="$1"
+  local url="$2"
+  local response_file="$3"
+  local payload_file="${4:-}"
+  local -a arguments=(--config "$curl_config" --request "$method")
+  if [[ -n "$payload_file" ]]; then
+    arguments+=(--header "Content-Type: application/json" --data-binary "@$payload_file")
+  fi
+  curl_status "$response_file" "${arguments[@]}" "$url"
+}
+
+write_direct_curl_config() {
+  local config_file="$1"
+  local upload_url="$2"
+  local content_type="$3"
+  local if_none_match="$4"
+  local nar_file="$5"
+
+  [[ "$upload_url" =~ ^https://[[:xdigit:]]{32}\.r2\.cloudflarestorage\.com/ ]] || die "upload session returned an unexpected R2 URL"
+  [[ "$content_type" == "application/octet-stream" ]] || die "upload session returned an unexpected Content-Type"
+  [[ "$if_none_match" == "*" ]] || die "upload session returned an unexpected If-None-Match value"
+
+  : > "$config_file"
+  chmod 600 "$config_file"
+  printf '%s\n' 'silent' >> "$config_file"
+  curl_config_line "$config_file" 'url' "$upload_url"
+  curl_config_line "$config_file" 'request' 'PUT'
+  curl_config_line "$config_file" 'header' "Content-Type: $content_type"
+  curl_config_line "$config_file" 'header' "If-None-Match: $if_none_match"
+  curl_config_line "$config_file" 'upload-file' "$nar_file"
+}
+
+initialize_upload() {
+  local nar_key="$1"
+  local nar_size="$2"
+  local nar_sha256="$3"
+  local response_file="$temporary_directory/upload-session.json"
+  local request_file="$temporary_directory/upload-request.json"
+  local attempt status
+
+  jq --null-input --compact-output \
+    --arg key "$nar_key" \
+    --arg sha256 "$nar_sha256" \
+    --argjson size "$nar_size" \
+    '{key: $key, size: $size, sha256: $sha256}' > "$request_file"
+
+  for ((attempt = 0; attempt <= retry_count; attempt++)); do
+    status="$(api_request POST "$cache_url/api/uploads" "$response_file" "$request_file")"
+    if [[ "$status" == "200" || "$status" == "201" ]]; then
+      cat "$response_file"
+      return 0
+    fi
+    if retryable_status "$status" && [[ "$attempt" -lt "$retry_count" ]]; then
+      retry_delay "$attempt"
+      continue
+    fi
+    die "could not create a direct upload session for $nar_key (HTTP $status)"
+  done
+}
+
+complete_upload() {
+  local upload_id="$1"
+  local response_file="$temporary_directory/upload-complete.json"
+  local attempt status
+
+  for ((attempt = 0; attempt <= retry_count; attempt++)); do
+    status="$(api_request POST "$cache_url/api/uploads/$upload_id/complete" "$response_file")"
+    if [[ "$status" == "200" || "$status" == "201" ]]; then
+      return 0
+    fi
+    if [[ "$attempt" -lt "$retry_count" ]]; then
+      if retryable_status "$status" || {
+        [[ "$status" == "409" ]] && jq --exit-status --raw-output \
+          '(.error.code // "") == "upload_not_ready" or (.error.code // "") == "upload_in_progress"' \
+          "$response_file" >/dev/null 2>&1
+      }; then
+        retry_delay "$attempt"
+        continue
+      fi
+    fi
+    die "could not complete direct upload $upload_id (HTTP $status)"
+  done
+}
+
+upload_nar() {
+  local nar_key="$1"
+  local nar_file="$2"
+  local nar_size nar_sha256 session already_exists upload_id upload_url content_type if_none_match
+  local direct_config response_file attempt status
+
+  nar_size="$(wc -c < "$nar_file" | tr -d '[:space:]')"
+  [[ "$nar_size" =~ ^[0-9]+$ ]] || die "could not determine size for $nar_key"
+  [[ "$nar_size" -le "$MAX_SINGLE_PUT_BYTES" ]] || die "$nar_key exceeds the 5 GiB single-PUT R2 limit; resumable uploads are not supported"
+  nar_sha256="$(nix hash file --type sha256 --base16 "$nar_file")"
+  [[ "$nar_sha256" =~ ^[0-9a-f]{64}$ ]] || die "could not calculate a SHA-256 digest for $nar_key"
+
+  printf 'Preparing direct upload for %s (%s bytes)\n' "$nar_key" "$nar_size"
+  session="$(initialize_upload "$nar_key" "$nar_size" "$nar_sha256")"
+  already_exists="$(jq --raw-output 'if .alreadyExists == true then "true" else "false" end' <<< "$session")" || die "upload session response was not valid JSON"
+  if [[ "$already_exists" == "true" ]]; then
+    printf 'NAR already exists: %s\n' "$nar_key"
+    return 0
+  fi
+
+  upload_id="$(jq --exit-status --raw-output '.uploadId // empty' <<< "$session")" || die "upload session did not contain uploadId"
+  upload_url="$(jq --exit-status --raw-output '.uploadUrl // empty' <<< "$session")" || die "upload session did not contain uploadUrl"
+  content_type="$(jq --exit-status --raw-output '.uploadHeaders["Content-Type"] // empty' <<< "$session")" || die "upload session did not contain Content-Type"
+  if_none_match="$(jq --exit-status --raw-output '.uploadHeaders["If-None-Match"] // empty' <<< "$session")" || die "upload session did not contain If-None-Match"
+  [[ -n "$upload_id" && -n "$upload_url" && -n "$content_type" && -n "$if_none_match" ]] || die "upload session response was incomplete"
+
+  direct_config="$temporary_directory/direct-$upload_id.curl"
+  write_direct_curl_config "$direct_config" "$upload_url" "$content_type" "$if_none_match" "$nar_file"
+  response_file="$temporary_directory/direct-response"
+  for ((attempt = 0; attempt <= retry_count; attempt++)); do
+    status="$(curl_status "$response_file" --config "$direct_config")"
+    if [[ "$status" =~ ^2[0-9][0-9]$ || "$status" == "412" ]]; then
+      complete_upload "$upload_id"
+      printf 'NAR completed: %s\n' "$nar_key"
+      return 0
+    fi
+    if retryable_status "$status" && [[ "$attempt" -lt "$retry_count" ]]; then
+      retry_delay "$attempt"
+      continue
+    fi
+    die "direct R2 upload failed for $nar_key (HTTP $status)"
+  done
+}
+
+publish_narinfo() {
+  local narinfo_key="$1"
+  local narinfo_file="$2"
+  local response_file="$temporary_directory/narinfo-response"
+  local attempt status
+
+  printf 'Publishing narinfo: %s\n' "$narinfo_key"
+  for ((attempt = 0; attempt <= retry_count; attempt++)); do
+    status="$(curl_status "$response_file" --config "$curl_config" --request PUT --upload-file "$narinfo_file" "$cache_url/$narinfo_key")"
+    if [[ "$status" == "201" || "$status" == "204" ]]; then
+      return 0
+    fi
+    if retryable_status "$status" && [[ "$attempt" -lt "$retry_count" ]]; then
+      retry_delay "$attempt"
+      continue
+    fi
+    die "could not publish narinfo $narinfo_key (HTTP $status)"
+  done
+}
+
+register_version() {
+  local narinfo_keys_file="$1"
+  local tags_file="$temporary_directory/tags.json"
+  local body_file="$temporary_directory/register-version.json"
+  local response_file="$temporary_directory/register-version-response.json"
+  local retention_json='null'
+  local pair key value attempt status
+
+  printf '{}' > "$tags_file"
+  for pair in "${tag_pairs[@]}"; do
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    jq --arg key "$key" --arg value "$value" '.[$key] = $value' "$tags_file" > "$tags_file.next"
+    mv "$tags_file.next" "$tags_file"
+  done
+  if [[ -n "$retention_days" ]]; then retention_json="$retention_days"; fi
+  jq --null-input \
+    --rawfile narinfo_keys "$narinfo_keys_file" \
+    --slurpfile tags "$tags_file" \
+    --argjson retention_days "$retention_json" \
+    '{narinfoKeys: ($narinfo_keys | split("\n") | map(select(length > 0))), tags: $tags[0]}
+     + (if $retention_days == null then {} else {retentionDays: $retention_days} end)' > "$body_file"
+
+  printf 'Registering %s/%s\n' "$package_name" "$version_name"
+  for ((attempt = 0; attempt <= retry_count; attempt++)); do
+    status="$(api_request PUT "$cache_url/api/packages/$package_name/versions/$version_name" "$response_file" "$body_file")"
+    if [[ "$status" == "200" || "$status" == "201" ]]; then
+      return 0
+    fi
+    if retryable_status "$status" && [[ "$attempt" -lt "$retry_count" ]]; then
+      retry_delay "$attempt"
+      continue
+    fi
+    die "could not register $package_name/$version_name (HTTP $status)"
+  done
+}
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --to) [[ "$#" -ge 2 ]] || die "--to requires a value"; cache_url="${2%/}"; shift 2 ;;
+    --package) [[ "$#" -ge 2 ]] || die "--package requires a value"; package_name="$2"; shift 2 ;;
+    --version) [[ "$#" -ge 2 ]] || die "--version requires a value"; version_name="$2"; shift 2 ;;
+    --token-file) [[ "$#" -ge 2 ]] || die "--token-file requires a value"; token_file="$2"; shift 2 ;;
+    --tag) [[ "$#" -ge 2 ]] || die "--tag requires KEY=VALUE"; tag_pairs+=("$2"); shift 2 ;;
+    --retention-days) [[ "$#" -ge 2 ]] || die "--retention-days requires a value"; retention_days="$2"; shift 2 ;;
+    --retries) [[ "$#" -ge 2 ]] || die "--retries requires a value"; retry_count="$2"; shift 2 ;;
+    --help) usage; success=true; exit 0 ;;
+    --) shift; installables=("$@"); break ;;
+    -*) die "unknown option: $1" ;;
+    *) installables=("$@"); break ;;
+  esac
+done
+
+[[ "$cache_url" =~ ^https://[^/]+$ ]] || die "--to must be an HTTPS origin without a path"
+valid_name "$package_name" || die "--package must be a URL-safe single path segment"
+valid_name "$version_name" || die "--version must be a URL-safe single path segment"
+[[ ${#installables[@]} -gt 0 ]] || die "at least one installable is required"
+[[ "$retry_count" =~ ^[0-9]+$ && "$retry_count" -le 20 ]] || die "--retries must be an integer from 0 through 20"
+[[ -z "$retention_days" || "$retention_days" =~ ^[0-9]+$ && "$retention_days" -le 36500 ]] || die "--retention-days must be an integer from 0 through 36500"
+[[ ${#tag_pairs[@]} -le 64 ]] || die "at most 64 --tag options are supported"
+for pair in "${tag_pairs[@]}"; do valid_tag "$pair" || die "invalid tag: $pair"; done
+
+for command_name in nix curl jq find awk wc sort mktemp chmod tr; do require_command "$command_name"; done
+if [[ -n "$token_file" ]]; then
+  [[ -f "$token_file" && -r "$token_file" ]] || die "--token-file is not a readable regular file"
+  write_token="$(<"$token_file")"
+else
+  write_token="${NIX_CACHE_WRITE_TOKEN:-}"
+fi
+[[ -n "$write_token" && "$write_token" != *$'\n'* && "$write_token" != *$'\r'* ]] || die "a single-line write token is required via --token-file or NIX_CACHE_WRITE_TOKEN"
+
+temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/nix-cache-upload.XXXXXXXX")"
+chmod 700 "$temporary_directory"
+file_cache="$temporary_directory/file-cache"
+mkdir -p "$file_cache"
+curl_config="$temporary_directory/api.curl"
+: > "$curl_config"
+chmod 600 "$curl_config"
+printf '%s\n' 'silent' >> "$curl_config"
+curl_config_line "$curl_config" 'header' "Authorization: Bearer $write_token"
+
+printf 'Generating a Nix file cache for %s installable(s)\n' "${#installables[@]}"
+nix copy --to "file://$file_cache" "${installables[@]}"
+
+narinfo_records="$temporary_directory/narinfo-records"
+nar_records="$temporary_directory/nar-records"
+: > "$narinfo_records"
+: > "$nar_records"
+narinfo_count=0
+while IFS= read -r narinfo_file; do
+  narinfo_key="$(basename "$narinfo_file")"
+  nar_key="$(awk '$1 == "URL:" { print substr($0, 6); exit }' "$narinfo_file")"
+  [[ "$narinfo_key" =~ ^[A-Za-z0-9._~-]+\.narinfo$ ]] || die "generated an invalid narinfo key: $narinfo_key"
+  [[ "$nar_key" =~ ^nar/[A-Za-z0-9._~/-]+$ && "$nar_key" != *..* ]] || die "narinfo $narinfo_key references an unsupported NAR key"
+  nar_file="$file_cache/$nar_key"
+  [[ -f "$nar_file" ]] || die "narinfo $narinfo_key references a missing NAR"
+  printf '%s\t%s\n' "$narinfo_key" "$narinfo_file" >> "$narinfo_records"
+  printf '%s\t%s\n' "$nar_key" "$nar_file" >> "$nar_records"
+  narinfo_count=$((narinfo_count + 1))
+done < <(find "$file_cache" -maxdepth 1 -type f -name '*.narinfo' -print | LC_ALL=C sort)
+[[ "$narinfo_count" -gt 0 ]] || die "Nix did not generate any narinfo files"
+
+LC_ALL=C sort -u "$nar_records" > "$nar_records.sorted"
+while IFS=$'\t' read -r nar_key nar_file; do
+  upload_nar "$nar_key" "$nar_file"
+done < "$nar_records.sorted"
+
+LC_ALL=C sort -u "$narinfo_records" > "$narinfo_records.sorted"
+narinfo_keys="$temporary_directory/narinfo-keys"
+: > "$narinfo_keys"
+while IFS=$'\t' read -r narinfo_key narinfo_file; do
+  publish_narinfo "$narinfo_key" "$narinfo_file"
+  printf '%s\n' "$narinfo_key" >> "$narinfo_keys"
+done < "$narinfo_records.sorted"
+
+register_version "$narinfo_keys"
+printf 'Published and registered %s Nix cache path(s) as %s/%s\n' "$narinfo_count" "$package_name" "$version_name"
+success=true

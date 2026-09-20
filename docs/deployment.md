@@ -142,16 +142,15 @@ curl -i https://cache.example.org/
 Then log in at `/admin`, confirm the settings and seeded retention rule, and
 perform an end-to-end test from a controlled Nix client:
 
-1. Upload a NAR with `nix copy --to` using a temporary netrc whose file mode is
-   `0600`.
-2. For a NAR larger than the Worker request limit, call `POST /api/uploads`,
-   PUT the file to the returned R2 URL, and call the completion endpoint.
-3. Upload or observe the corresponding narinfo.
-4. Register the package/version with the write-token API.
-5. Read the result with `nix copy --from` or `nix store cat --store`; when
+1. Upload an ordinary-sized NAR with `nix copy --to` using a temporary netrc
+   whose file mode is `0600` to verify stock compatibility.
+2. Run `bin/nix-cache-upload --to <origin> --package <name> --version <name>
+   <installable>` with `NIX_CACHE_WRITE_TOKEN` or `--token-file`. It uploads
+   NARs directly to R2, then publishes narinfos and registers the version.
+3. Read the result with `nix copy --from` or `nix store cat --store`; when
    direct reads are enabled, verify that Nix follows the short-lived R2
    redirect.
-6. Test a Range request and inspect the Worker logs for safe structured events.
+4. Test a Range request and inspect the Worker logs for safe structured events.
 
 Replace `cache.example.org` with the real HTTPS hostname. Do not paste real
 tokens into these commands or into documentation.

@@ -134,76 +134,30 @@ if [[ "$small_downloaded_sha256" != "$small_expected_sha256" ]]; then
   exit 1
 fi
 
-printf 'Generating a canonical Nix cache entry for the over-100 MiB NAR...\n'
-large_file_cache="$temporary_directory/large-file-cache"
-mkdir -p "$large_file_cache"
-nix copy --to "file://$large_file_cache" "$large_store_path"
+test_package="nix-cache-e2e-${GITHUB_RUN_ID:-manual}"
+test_version="attempt-${GITHUB_RUN_ATTEMPT:-0}"
+client_output="$temporary_directory/nix-cache-upload.log"
+printf 'Publishing the small and over-100 MiB paths with nix-cache-upload...\n'
+NIX_CACHE_WRITE_TOKEN="$NIX_CACHE_TESTING_WRITE_TOKEN" \
+  bin/nix-cache-upload \
+    --to "$base_url" \
+    --package "$test_package" \
+    --version "$test_version" \
+    --tag integration=real-nix \
+    "$small_store_path" "$large_store_path" | tee "$client_output"
 
-large_narinfo_file="$(find "$large_file_cache" -maxdepth 1 -type f -name '*.narinfo' -print -quit)"
-if [[ -z "$large_narinfo_file" ]]; then
-  printf 'Nix did not generate a narinfo file for the large payload\n' >&2
+largest_client_nar_size="$(awk -F'[()]' '/^Preparing direct upload for / { value = $2; sub(/ bytes$/, "", value); if (value > largest) largest = value } END { print largest + 0 }' "$client_output")"
+if [[ "$largest_client_nar_size" -le $((100 * 1024 * 1024)) ]]; then
+  printf 'nix-cache-upload did not produce an over-100 MiB direct NAR\n' >&2
   exit 1
 fi
 
-large_narinfo_key="$(basename "$large_narinfo_file")"
-large_nar_key="$(awk '$1 == "URL:" { print $2; exit }' "$large_narinfo_file")"
-large_nar_file="$large_file_cache/$large_nar_key"
-if [[ ! -f "$large_nar_file" ]]; then
-  printf 'The NAR referenced by the generated narinfo is missing\n' >&2
+large_narinfo_key="$(basename "$large_store_path").narinfo"
+large_nar_key="$(retry_cache_request "$base_url/$large_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
+if [[ -z "$large_nar_key" ]]; then
+  printf 'nix-cache-upload did not publish the large narinfo\n' >&2
   exit 1
 fi
-
-large_nar_size="$(wc -c < "$large_nar_file" | tr -d '[:space:]')"
-if [[ "$large_nar_size" -le $((100 * 1024 * 1024)) ]]; then
-  printf 'The large NAR is not larger than 100 MiB\n' >&2
-  exit 1
-fi
-large_nar_sha256="$(sha256sum "$large_nar_file" | awk '{print $1}')"
-
-upload_request="$(jq --null-input --compact-output \
-  --arg key "$large_nar_key" \
-  --arg sha256 "$large_nar_sha256" \
-  --argjson size "$large_nar_size" \
-  '{key: $key, size: $size, sha256: $sha256}')"
-upload_session="$(curl --fail-with-body --silent --show-error \
-  --request POST \
-  --header "Authorization: Bearer $NIX_CACHE_TESTING_WRITE_TOKEN" \
-  --header 'Content-Type: application/json' \
-  --data "$upload_request" \
-  "$base_url/api/uploads")"
-upload_id="$(jq --exit-status --raw-output '.uploadId' <<<"$upload_session")"
-upload_url="$(jq --exit-status --raw-output '.uploadUrl' <<<"$upload_session")"
-upload_content_type="$(jq --exit-status --raw-output '.uploadHeaders["Content-Type"]' <<<"$upload_session")"
-upload_if_none_match="$(jq --exit-status --raw-output '.uploadHeaders["If-None-Match"]' <<<"$upload_session")"
-if [[ -z "$upload_id" || -z "$upload_url" || -z "$upload_content_type" || -z "$upload_if_none_match" ]]; then
-  printf 'The direct-upload API returned an incomplete session\n' >&2
-  exit 1
-fi
-
-printf 'Uploading the over-100 MiB NAR directly to R2...\n'
-curl --fail --silent --show-error \
-  --request PUT \
-  --header "Content-Type: $upload_content_type" \
-  --header "If-None-Match: $upload_if_none_match" \
-  --upload-file "$large_nar_file" \
-  "$upload_url" \
-  --output /dev/null
-
-completion_response="$(curl --fail-with-body --silent --show-error \
-  --request POST \
-  --header "Authorization: Bearer $NIX_CACHE_TESTING_WRITE_TOKEN" \
-  "$base_url/api/uploads/$upload_id/complete")"
-if [[ "$(jq --exit-status --raw-output '.status' <<<"$completion_response")" != "completed" ]]; then
-  printf 'The direct-upload completion API did not complete the session\n' >&2
-  exit 1
-fi
-
-printf 'Publishing the Nix-generated narinfo through the standard PUT path...\n'
-curl --fail-with-body --silent --show-error \
-  --netrc-file "$netrc_file" \
-  --upload-file "$large_narinfo_file" \
-  "$base_url/$large_narinfo_key" \
-  --output /dev/null
 
 large_nar_etag="$(retry_cache_request --head "$base_url/$large_nar_key" | awk 'BEGIN { IGNORECASE = 1 } /^etag:/ { print $2 }' | tr -d '\r' | tail -n 1)"
 if [[ -z "$large_nar_etag" ]]; then
@@ -221,20 +175,6 @@ if [[ "$large_downloaded_sha256" != "$large_expected_sha256" ]]; then
   printf 'Nix did not retrieve the expected large payload\n' >&2
   exit 1
 fi
-
-test_package="nix-cache-e2e-${GITHUB_RUN_ID:-manual}"
-test_version="attempt-${GITHUB_RUN_ATTEMPT:-0}"
-registration_body="$(jq --null-input --compact-output \
-  --arg small_narinfo_key "$small_narinfo_key" \
-  --arg large_narinfo_key "$large_narinfo_key" \
-  '{narinfoKeys: [$small_narinfo_key, $large_narinfo_key]}')"
-curl --fail-with-body --silent --show-error \
-  --request PUT \
-  --header "Authorization: Bearer $NIX_CACHE_TESTING_WRITE_TOKEN" \
-  --header 'Content-Type: application/json' \
-  --data "$registration_body" \
-  "$base_url/api/packages/$test_package/versions/$test_version" \
-  --output /dev/null
 
 deletion_body="$(jq --null-input --compact-output \
   --arg package_name "$test_package" \
@@ -259,7 +199,7 @@ for attempt in $(seq 1 30); do
     "$base_url/api/admin/jobs/$deletion_job_id")"
   deletion_status="$(jq --exit-status --raw-output '.status' <<<"$deletion_job")"
   if [[ "$deletion_status" == "completed" ]]; then
-    printf 'Real Nix integration test passed: standard small upload and direct large upload were both readable from the Worker.\n'
+    printf 'Real Nix integration test passed: stock small upload and client-managed direct NAR uploads were readable from the Worker.\n'
     exit 0
   fi
   if [[ "$deletion_status" == "failed" ]]; then

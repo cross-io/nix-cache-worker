@@ -104,8 +104,33 @@ machine cache.example.org login nix password <WRITE_TOKEN>
 
 The management console also shows the standard `nix copy` and version
 registration commands after an administrator logs in. Standard `nix copy`
-remains the compatibility path for ordinary-sized objects. A NAR larger than
-the Worker request-body limit must use the direct-upload API:
+remains the compatibility path for ordinary-sized objects. CI publishers should
+normally use the repository's zero-compile client, which automatically exports
+a complete closure, uploads every NAR through the direct-upload API, publishes
+narinfo in the required order, and registers the version:
+
+```bash
+NIX_CACHE_WRITE_TOKEN=... bin/nix-cache-upload \
+  --to https://cache.example.org \
+  --package example --version ci-123 \
+  --tag channel=main --retention-days 30 \
+  nixpkgs#hello
+```
+
+The client requires Bash, Nix with the `nix` command, curl, jq, and standard
+POSIX utilities. `--token-file PATH` reads the write token from a file and
+overrides `NIX_CACHE_WRITE_TOKEN`; neither form is printed. `--package` and
+`--version` are explicit because version names are opaque. Each repeated
+`--tag KEY=VALUE` and optional `--retention-days DAYS` is sent to the existing
+version registration endpoint. Retryable network failures are retried three
+times by default and may be changed with `--retries`.
+
+The client uses one R2 PUT per NAR, including small NARs. It rejects a NAR
+larger than R2's roughly 5 GiB single-PUT limit; it does not implement
+resumable or multipart client uploads. Stock `nix copy --to` remains available
+and continues to send its ordinary-sized request through the Worker.
+
+The underlying direct-upload API is also available to custom CI integrations:
 
 ```text
 POST /api/uploads
@@ -132,7 +157,8 @@ curl --fail-with-body -X POST \
 
 Only after completion should the corresponding `.narinfo` be uploaded through
 the normal cache PUT path. The direct flow uses one R2 single-object PUT and is
-not resumable; its maximum is the R2 single-upload limit.
+not resumable; its maximum is the R2 single-upload limit. The bundled client
+performs this ordering and version registration automatically.
 
 Stock `nix copy --to` cannot be transparently redirected to a presigned PUT:
 it has no upload-session discovery phase, and a redirect still places its

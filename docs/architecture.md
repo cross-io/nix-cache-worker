@@ -31,6 +31,11 @@ Large CI NAR
    +--> Worker verifies, finalizes, and indexes canonical key
 ```
 
+`bin/nix-cache-upload` owns this CI orchestration: it first materializes a
+local Nix file cache, uploads every distinct NAR sequentially through the
+session flow, then publishes the complete narinfo set and registers the
+requested package/version. It does not change the stock Nix HTTP protocol.
+
 ## Storage boundaries
 
 R2 is authoritative for object bytes and supports streaming single writes for
