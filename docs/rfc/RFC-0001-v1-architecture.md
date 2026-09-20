@@ -35,6 +35,9 @@ become a general-purpose object overwrite API.
 Worker Secrets are the only token source. Tokens must not appear in source,
 D1, URLs, browser persistent storage, or logs. Nix netrc Basic credentials are
 accepted only as an HTTPS-compatible form of the same write/read secrets.
+Each supplied token is SHA-256 hashed and compared through Cloudflare Workers'
+`crypto.subtle.timingSafeEqual()` primitive; authentication does not use a
+language-level string comparison or return early for unequal token lengths.
 
 The public cache surface remains compatible with `nix copy --to` and
 `nix copy --from`, including GET, HEAD, Range, ETag, conditional requests, and

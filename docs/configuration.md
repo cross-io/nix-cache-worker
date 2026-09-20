@@ -1,74 +1,43 @@
 # Configuration and operations
 
-The first-time Cloudflare setup is documented in
-[`deployment.md`](deployment.md). This page describes the runtime values and
-operator workflow after the Worker configuration has been initialized.
-
-## Private deployment configuration
-
-The repository intentionally does not track `wrangler.jsonc`. Start from the
-safe template in a fresh checkout:
+Start from the ignored deployment template:
 
 ```bash
 cp wrangler.jsonc.example wrangler.jsonc
 ```
 
-Replace the R2 bucket name, D1 database name and IDs, and any deployment
-specific values before using Wrangler. The private file may contain a custom
-hostname and public signing key, but it must remain ignored and must never be
-committed.
+## Bindings and variables
 
-For local-only secrets:
-
-```bash
-cp .dev.vars.example .dev.vars
-```
-
-Use real values only in the copied local file. Production authentication
-values belong in Worker Secrets, not in `wrangler.jsonc`, D1, URLs, cookies,
-browser persistent storage, or logs.
-
-## Cloudflare bindings and variables
-
-The checked-in example binds:
-
-- `CACHE_BUCKET` to the R2 bucket containing immutable cache objects;
-- `DB` to the D1 database containing indexes, memberships, policies, jobs, and
-  audit metadata;
-- an every-eight-hours `0 */8 * * *` Cron trigger for garbage collection.
-
-The standard non-secret variables are:
+The Worker needs one R2 binding, one D1 binding, and the Cron trigger. The
+single `migrations/0001_initial.sql` file is the complete schema for a fresh
+database.
 
 ```text
 DEFAULT_STORE_DIR=/nix/store
 DEFAULT_PRIORITY=40
 DEFAULT_WANT_MASS_QUERY=1
 DEFAULT_RETENTION_DAYS=7
-NIX_PUBLIC_SIGN_KEY=<optional-public-signing-key>
 R2_ACCOUNT_ID=<cloudflare-account-id>
 R2_BUCKET_NAME=<cache-bucket-name>
+R2_S3_ENDPOINT=<optional-https-r2-s3-endpoint>
 DIRECT_UPLOAD_URL_TTL_SECONDS=3600
 DIRECT_DOWNLOAD_URL_TTL_SECONDS=900
+NIX_PUBLIC_SIGN_KEY=<optional-public-signing-key>
 ```
 
-`NIX_PUBLIC_SIGN_KEY` is public metadata used by the home page's Nix client
-example. The product footer always links to the canonical project repository.
-Neither setting is a bearer secret.
-`R2_ACCOUNT_ID` and `R2_BUCKET_NAME` are used to construct the R2 S3 endpoint
-for presigned URLs. Presigned URLs use the R2 S3 API hostname and cannot use
-the Worker's custom domain.
-`DIRECT_DOWNLOAD_URL_TTL_SECONDS` is optional. When configured between 60
-seconds and seven days, supported NAR and narinfo GET/HEAD requests receive a
-short-lived `307` redirect to R2. The redirect is `no-store`; R2 is the source
-of truth and returns the final Range, ETag, and conditional response. Missing
-objects, and objects written before direct reads were enabled, stay on the
-binding-backed Worker path. Omit the setting to keep binding-backed Worker
-reads for every object.
+`DIRECT_DOWNLOAD_URL_TTL_SECONDS` is the lifetime of Worker-generated R2 read
+URLs. Use a value between 60 seconds and seven days. R2 S3 credentials are
+required for presigning and belong in Worker Secrets, not in D1, source code,
+URLs, cookies, or logs.
 
-## Worker Secrets
+`DEFAULT_STORE_DIR`, `DEFAULT_PRIORITY`, and `DEFAULT_WANT_MASS_QUERY` form
+the static `/nix-cache-info` response. The Worker does not read settings from
+D1. If an R2 Custom Domain is enabled, write the same response to the R2
+`nix-cache-info` object during deployment.
 
-Configure the independent authentication roles through Wrangler or the
-Cloudflare Dashboard:
+## Authentication and read modes
+
+Configure independent secrets as needed:
 
 ```bash
 npx wrangler secret put READ_TOKEN
@@ -78,137 +47,109 @@ npx wrangler secret put R2_S3_ACCESS_KEY_ID
 npx wrangler secret put R2_S3_SECRET_ACCESS_KEY
 ```
 
-Keep the values out of shell history where possible and never print them.
-`READ_TOKEN` permits authenticated reads, `WRITE_TOKEN` permits cache writes
-and version registration, and `ADMIN_TOKEN` permits policy, pin, GC, and
-version-deletion operations. Anonymous cache reads remain enabled.
+When `READ_TOKEN` is empty, anonymous Worker reads are allowed and an R2
+Custom Domain may be used as a direct anonymous entry point. When it is
+non-empty, `GET` and `HEAD` cache paths require read, write, or admin
+authentication and always redirect through the Worker. Do not expose a public
+R2 Custom Domain in that mode.
 
-The R2 S3 credentials must be a bucket-scoped R2 API token with object read and
-write permissions. They are used only by the Worker to create short-lived
-presigned upload and download URLs and must never be sent to CI clients.
+Read redirects use `Cache-Control: no-store`; the final R2 object uses the
+immutable one-year metadata. Deletion is best effort: CDN, browser, and
+presigned URL caches may continue to return old bytes or 404s.
 
-## Nix clients and publishers
+The Worker also accepts Nix netrc-generated Basic credentials where the
+password equals the appropriate Worker Secret. Use Basic only over HTTPS.
 
-Reads use the deployment's HTTPS origin. Keep `cache.nixos.org` and its
-official key when adding this cache to NixOS or nix-darwin. The public `/` page
-renders the current request origin and configured public key into a complete
-example.
+## R2 Custom Domain cache rule
 
-For `nix copy --to`, create a mode-0600 netrc entry whose password is the Worker
-write secret. The Basic form is a compatibility mechanism for Nix clients and
-must be used only over HTTPS:
+The Custom Domain is optional. If enabled, create one Cache Rule covering:
 
 ```text
-machine cache.example.org login nix password <WRITE_TOKEN>
+/nix-cache-info
+/*.narinfo
+/nar/*
 ```
 
-The management console also shows the standard `nix copy` and version
-registration commands after an administrator logs in. Standard `nix copy`
-remains the compatibility path for ordinary-sized objects. CI publishers should
-normally use the repository's zero-compile client, which automatically exports
-a complete closure, uploads every NAR through the direct-upload API, publishes
-narinfo in the required order, and registers the version:
+Set an edge TTL of about one year, enable caching of 404 responses, and use
+the R2 object metadata as the browser/client cache policy. There is no Worker
+cache-generation key to invalidate. Clear old edge cache and delete old R2
+objects before deploying the new schema.
+
+To publish cache-info for the Custom Domain, generate the same bytes as the
+Worker response and run an R2 object upload, for example:
 
 ```bash
-NIX_CACHE_WRITE_TOKEN=... bin/nix-cache-upload \
-  --to https://cache.example.org \
-  --package example --version ci-123 \
-  --tag channel=main --retention-days 30 \
-  nixpkgs#hello
+printf 'StoreDir: %s\nWantMassQuery: %s\nPriority: %s\n' \
+  "$DEFAULT_STORE_DIR" "$DEFAULT_WANT_MASS_QUERY" "$DEFAULT_PRIORITY" > /tmp/nix-cache-info
+npx wrangler r2 object put "$R2_BUCKET_NAME/nix-cache-info" \
+  --file /tmp/nix-cache-info \
+  --content-type 'text/plain; charset=utf-8' \
+  --cache-control 'public, max-age=31536000, immutable'
 ```
 
-The client requires Bash, Nix with the `nix` command, curl, jq, and standard
-POSIX utilities. `--token-file PATH` reads the write token from a file and
-overrides `NIX_CACHE_WRITE_TOKEN`; neither form is printed. `--package` and
-`--version` are explicit because version names are opaque. Each repeated
-`--tag KEY=VALUE` and optional `--retention-days DAYS` is sent to the existing
-version registration endpoint. Retryable network failures are retried three
-times by default and may be changed with `--retries`.
+## Standard publishing
 
-The client uses one R2 PUT per NAR, including small NARs. It rejects a NAR
-larger than R2's roughly 5 GiB single-PUT limit; it does not implement
-resumable or multipart client uploads. Stock `nix copy --to` remains available
-and continues to send its ordinary-sized request through the Worker.
-
-The underlying direct-upload API is also available to custom CI integrations:
+Use the ordinary Nix protocol for normal-sized objects:
 
 ```text
+PUT /nar/<name>
+PUT /<hash>.narinfo
+PUT /api/packages/<package>/<version>
+```
+
+NAR and narinfo bytes are immutable. A same-content retry succeeds
+idempotently; different content never overwrites the final key. A narinfo is
+accepted only after its referenced NAR is ready in R2 and indexed in D1.
+
+## Stateless direct NAR upload
+
+There is no upload ID or staging key. Request a final-key presigned URL:
+
+```http
 POST /api/uploads
 Authorization: Bearer <WRITE_TOKEN>
 Content-Type: application/json
 
-{"key":"nar/example.nar","size":123456789,"sha256":"<lowercase sha256>"}
+{"key":"nar/example.nar","size":123,"sha256":"<lowercase sha256>"}
 ```
 
-The response contains `uploadId`, `uploadUrl`, and `uploadHeaders`. Send one
-direct `PUT` to `uploadUrl` with those headers and the exact file length, then
-complete the session:
+The response contains `key`, `size`, `sha256`, `uploadUrl`, `uploadHeaders`,
+and `alreadyExists`. If `alreadyExists` is false, PUT the exact bytes to the
+returned URL using the returned `Content-Type` and `If-None-Match: *` headers.
+Then verify and index it:
+
+```http
+POST /api/uploads/complete
+Authorization: Bearer <WRITE_TOKEN>
+Content-Type: application/json
+
+{"key":"nar/example.nar","size":123,"sha256":"<lowercase sha256>"}
+```
+
+Completion performs one R2 `HEAD` and one R2 `GET` to calculate SHA-256. A
+wrong size or digest deletes the final object. Completion is idempotent after
+successful verification. The bundled `bin/nix-cache-upload` client uses this
+flow and publishes narinfo only after completion.
+
+## Lifecycle and retention
+
+Register versions with a complete narinfo member list. Membership counters and
+NAR reference counters are maintained in D1 batches. Shared NARs are deleted
+only after their last live narinfo reference is removed. GC and deletion are
+persistent, bounded, and retryable.
+
+Retention values affect only GC. Change `DEFAULT_RETENTION_DAYS` and other
+deployment values through Wrangler; change policies and pins through the admin
+APIs. No deployment setting is stored in D1.
+
+## Verification
 
 ```bash
-curl --fail-with-body -X PUT "$UPLOAD_URL" \
-  -H 'Content-Type: application/octet-stream' \
-  -H 'If-None-Match: *' \
-  --data-binary @result.nar
-
-curl --fail-with-body -X POST \
-  "https://cache.example.org/api/uploads/$UPLOAD_ID/complete" \
-  -H "Authorization: Bearer $WRITE_TOKEN"
-```
-
-Only after completion should the corresponding `.narinfo` be uploaded through
-the normal cache PUT path. The direct flow uses one R2 single-object PUT and is
-not resumable; its maximum is the R2 single-upload limit. The bundled client
-performs this ordering and version registration automatically.
-
-Stock `nix copy --to` cannot be transparently redirected to a presigned PUT:
-it has no upload-session discovery phase, and a redirect still places its
-request body at the Worker. CI publishers must use the explicit session API
-for direct NAR uploads. In contrast, `nix copy --from` and `nix store cat`
-follow the optional presigned GET/HEAD redirects automatically.
-
-## Package/version lifecycle
-
-Upload NARs first, then narinfos, then register the complete build version:
-
-```text
-PUT /api/packages/{packageName}/versions/{versionName}
-Authorization: Bearer <write-token>
-```
-
-The registration body lists all narinfo members and may include arbitrary tags
-and a version-level retention override. Registration is idempotent: an existing
-package/version identity is accepted again and its successful registration
-renews `registered_at`. Version names are opaque and are never parsed for
-ordering.
-
-## Retention and garbage collection
-
-The baseline migration seeds an editable rule that protects the newest three
-versions for each exact package name and complete tag combination. The default
-finite retention is seven days. Administrators can change the default, create
-structured rules, pin versions, run GC, and request confirmed deletion from
-the console. A structured rule may also set `capacityVersions` to limit the
-number of active versions tolerated by each computed group; omitted or `null`
-means unlimited.
-
-Pins protect versions from automatic GC only. Explicit deletion of a pinned
-version requires confirmation and is recorded in the audit log. Persistent GC
-and deletion jobs process bounded batches and can resume after a Worker
-interruption.
-
-## Verification and observability
-
-After deployment, check `/nix-cache-info`, the admin console, a NAR Range
-request, and a signed `nix copy --from` or `nix store cat --store` operation.
-Run the repository checks with:
-
-```bash
+curl -i https://cache.example.org/nix-cache-info
+curl -i -H "Authorization: Bearer $READ_TOKEN" https://cache.example.org/nar/missing.nar
 npm run typecheck
 npm test
 npm run build
 ```
 
-The Worker emits structured events for cache hits/misses, R2 reads/writes,
-served/uploaded bytes, and authentication failures. Logs contain safe request,
-status, object-kind, and byte-count fields only; tokens and raw
-`Authorization` headers must never appear.
+Never log or commit tokens, presigned URLs, or raw Authorization headers.

@@ -16,8 +16,9 @@ selected by `CLOUDFLARE_ACCOUNT_ID`:
 | D1 database | `nix-cache-testing` |
 | Worker | `nix-cache-testing` (created by the workflow if absent) |
 
-The first run resolves the D1 database UUID from its name, applies all
-repository migrations, and deploys the Worker. Ensure the account's
+Each run resolves the D1 database UUID from its name, clears the isolated R2
+bucket and D1 schema, applies the single repository migration, and deploys the
+Worker. Ensure the account's
 `workers.dev` hostname is enabled, or point `NIX_CACHE_TESTING_URL` at an
 already-configured HTTPS custom domain for that Worker.
 
@@ -73,6 +74,13 @@ The test makes two Nix store entries and exercises both publisher interfaces:
    temporary version. `nix store cat --store` downloads and verifies the large
    target file from the Worker.
 
+The small read remains anonymous. Before the large read, the script gives real
+`nix store cat` a separate mode-0600 netrc with an intentionally invalid token
+and requires that request to fail. It then reads the same target with another
+mode-0600 netrc containing `NIX_CACHE_TESTING_READ_TOKEN`. This proves Nix
+sends its Basic credential and that the configured read secret is usable: an
+invalid supplied credential is rejected before the public-read route can run.
+
 The client-managed large case intentionally uses the direct-upload protocol:
 stock `nix copy --to` cannot discover or use this API, and routing its 100+ MiB
 request through the Worker would not validate the purpose of the feature. The testing
@@ -84,8 +92,19 @@ GET and HEAD return a signed `307` R2 URL without logging that bearer URL.
 
 After both reads succeed, the client has registered its narinfos as a temporary
 test version and the script uses the admin deletion job to remove the version,
-narinfos, and unshared final NARs. A direct-upload staging object cannot be removed until
-its signed URL expires: deleting it earlier would let a holder of that URL reuse
-the signed `If-None-Match: *` PUT. The isolated test configuration therefore
-uses a 15-minute direct-upload URL and an hourly Cron cleanup, bounding staging
-retention to roughly 75 minutes without changing the production schedule.
+narinfos, and unshared final NARs. Deletion is intentionally best effort for
+edge and client caches, while D1 reference counters strictly protect shared
+NARs. There are no staging objects or upload-session cleanup jobs in this
+architecture.
+
+Before publishing, the script also materializes a local file cache and records
+the deterministic final NAR/narinfo keys. If a later command fails or GitHub
+Actions cancels the run, its EXIT trap uses the isolated deployment credential
+to perform best-effort cleanup of only those known, unreferenced final objects
+and their D1 rows. Any final-key object that was not indexed is explicitly
+removed by the cleanup path after the test has stopped using it.
+The script deletes a D1 object row only after the matching R2 deletion succeeds;
+on a transient R2 failure it retains the index rather than creating an
+unrecoverable R2/D1 inconsistency.
+The EXIT trap also converts HUP, INT, and TERM into nonzero exits so GitHub
+Actions cancellation invokes the same partial-object cleanup path.

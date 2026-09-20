@@ -113,13 +113,15 @@ export async function createPresignedPut(
 ): Promise<PresignedPut> {
   const contentType = "application/octet-stream";
   const ifNoneMatch = "*";
+  const cacheControl = "public, max-age=31536000, immutable";
   const presigned = await createPresignedRequest(env, key, "PUT", expiresInSeconds, {
     "content-type": contentType,
     "if-none-match": ifNoneMatch,
+    "cache-control": cacheControl,
   }, issuedAt);
   return {
     ...presigned,
-    headers: { "Content-Type": contentType, "If-None-Match": ifNoneMatch },
+    headers: { "Content-Type": contentType, "If-None-Match": ifNoneMatch, "Cache-Control": cacheControl },
   };
 }
 
@@ -183,9 +185,9 @@ export function directUploadTtl(env: Bindings): number {
   return value;
 }
 
-export function directDownloadTtl(env: Bindings): number | null {
+export function directDownloadTtl(env: Bindings): number {
   const configured = env.DIRECT_DOWNLOAD_URL_TTL_SECONDS;
-  if (!configured) return null;
+  if (!configured) return 60 * 60;
   const value = Number(configured);
   if (!Number.isInteger(value) || value < 60 || value > MAX_PRESIGN_SECONDS) {
     throw new AppError("invalid_download_expiry", `DIRECT_DOWNLOAD_URL_TTL_SECONDS must be between 60 and ${MAX_PRESIGN_SECONDS}`, 503);

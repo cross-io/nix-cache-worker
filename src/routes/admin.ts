@@ -17,7 +17,7 @@ import {
 } from "../domain/policy";
 import { emitAudit } from "../observability";
 import { getJob, createDeletionJob, findActiveDeletionJob, runQueuedJobs, scheduleGcJob, runJob } from "../jobs/jobs";
-import { bumpCacheGeneration, getSetting, getVersion, now, parseTags, type VersionRow } from "../storage/db";
+import { getVersion, now, parseTags, type VersionRow } from "../storage/db";
 import { serializeVersion, validateNonNegativeInteger, validatePackageName, validateTags, validateVersionName } from "./versions";
 import { requireRole } from "../middleware/auth";
 
@@ -83,7 +83,7 @@ async function listPackageNames(env: AppEnv["Bindings"], query: string, limit: n
 }
 
 async function fallbackRetention(env: AppEnv["Bindings"]): Promise<number> {
-  const value = Number(await getSetting(env, "default_retention_days") ?? env.DEFAULT_RETENTION_DAYS ?? "7");
+  const value = Number(env.DEFAULT_RETENTION_DAYS ?? "7");
   return Number.isSafeInteger(value) && value >= 0 ? value : 7;
 }
 
@@ -391,7 +391,6 @@ adminRoutes.patch("/api/admin/packages/:packageName/versions/:versionName", asyn
     if (current?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
     throw new AppError("version_busy", "The version changed before the update could be applied", 409, { state: current?.state ?? "missing" });
   }
-  await bumpCacheGeneration(c.env);
   await emitAudit(c.env, "version_update", c.get("role"), `${packageName}/${versionName}`, { versionId: row.version_id, tags, retentionDays });
   const updated = await getVersion(c.env, packageName, versionName);
   if (!updated) throw new AppError("not_found", "The version was not found", 404);
@@ -548,7 +547,6 @@ adminRoutes.post("/api/admin/policies", async (c) => {
   const result = await c.env.DB.prepare(
     "INSERT INTO gc_policies (name, conditions_json, group_by_json, last_n, duration_days, capacity_versions, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
   ).bind(policy.name, JSON.stringify(policy.conditions), JSON.stringify(policy.groupBy), policy.lastN, policy.durationDays, policy.capacityVersions, timestamp, timestamp).run();
-  await bumpCacheGeneration(c.env);
   await emitAudit(c.env, "policy_create", c.get("role"), policy.name);
   return c.json({ id: result.meta.last_row_id, ...policy }, 201);
 });
@@ -562,7 +560,6 @@ adminRoutes.put("/api/admin/policies/:policyId", async (c) => {
     "UPDATE gc_policies SET name = ?, conditions_json = ?, group_by_json = ?, last_n = ?, duration_days = ?, capacity_versions = ?, updated_at = ? WHERE id = ?",
   ).bind(policy.name, JSON.stringify(policy.conditions), JSON.stringify(policy.groupBy), policy.lastN, policy.durationDays, policy.capacityVersions, now(), id).run();
   if (result.meta.changes === 0) throw new AppError("not_found", "The policy was not found", 404);
-  await bumpCacheGeneration(c.env);
   await emitAudit(c.env, "policy_update", c.get("role"), String(id));
   return c.json({ id, ...policy });
 });
@@ -572,37 +569,6 @@ adminRoutes.delete("/api/admin/policies/:policyId", async (c) => {
   if (!Number.isSafeInteger(id)) throw new AppError("invalid_policy", "Policy ID is invalid", 422);
   const result = await c.env.DB.prepare("DELETE FROM gc_policies WHERE id = ?").bind(id).run();
   if (result.meta.changes === 0) throw new AppError("not_found", "The policy was not found", 404);
-  await bumpCacheGeneration(c.env);
   await emitAudit(c.env, "policy_delete", c.get("role"), String(id));
   return c.body(null, 204);
-});
-
-adminRoutes.get("/api/admin/settings", async (c) => {
-  const result = await c.env.DB.prepare("SELECT key, value, updated_at FROM settings ORDER BY key").all();
-  const settings: Record<string, string> = {
-    store_dir: c.env.DEFAULT_STORE_DIR ?? "/nix/store",
-    priority: c.env.DEFAULT_PRIORITY ?? "40",
-    want_mass_query: c.env.DEFAULT_WANT_MASS_QUERY ?? "1",
-    default_retention_days: c.env.DEFAULT_RETENTION_DAYS ?? "7",
-  };
-  for (const row of result.results as Array<{ key: string; value: string }>) {
-    if (row.key !== "worker_cache_generation") settings[row.key] = row.value;
-  }
-  return c.json(settings);
-});
-
-adminRoutes.put("/api/admin/settings", async (c) => {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => { throw new AppError("invalid_json", "The request body must be JSON", 400); });
-  const allowed = new Set(["store_dir", "priority", "want_mass_query", "default_retention_days"]);
-  for (const [key, value] of Object.entries(body)) {
-    if (!allowed.has(key) || typeof value !== "string" || value.length > 128) throw new AppError("invalid_settings", `Invalid setting: ${key}`, 422);
-    if (key === "default_retention_days" && (!/^\d+$/.test(value) || Number(value) > 36500)) throw new AppError("invalid_settings", "default_retention_days is invalid", 422);
-    await c.env.DB.prepare(
-      `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-    ).bind(key, value, now()).run();
-  }
-  if (Object.keys(body).length > 0) await bumpCacheGeneration(c.env);
-  await emitAudit(c.env, "settings_update", c.get("role"), null, { keys: Object.keys(body) });
-  return c.json({ ok: true });
 });

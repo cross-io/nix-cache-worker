@@ -9,6 +9,8 @@ export type ObjectRow = {
   size: number;
   uploaded_at: string;
   state: string;
+  narinfo_ref_count: number;
+  version_member_count: number;
 };
 
 export type PackageRow = {
@@ -47,30 +49,11 @@ export async function upsertObject(env: Bindings, object: {
 }): Promise<void> {
   const timestamp = now();
   await env.DB.prepare(
-    `INSERT INTO objects (r2_key, kind, etag, sha256, size, uploaded_at, state)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO objects (r2_key, kind, etag, sha256, size, uploaded_at, state, narinfo_ref_count, version_member_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)
      ON CONFLICT(r2_key) DO UPDATE SET etag = excluded.etag, sha256 = excluded.sha256,
        size = excluded.size, state = excluded.state`,
   ).bind(object.key, object.kind, object.etag, object.sha256, object.size, timestamp, object.state ?? "ready").run();
-}
-
-export async function getSetting(env: Bindings, key: string): Promise<string | null> {
-  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value: string }>();
-  return row?.value ?? null;
-}
-
-export async function setSetting(env: Bindings, key: string, value: string): Promise<void> {
-  await env.DB.prepare(
-    `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-  ).bind(key, value, now()).run();
-}
-
-export async function bumpCacheGeneration(env: Bindings): Promise<void> {
-  await env.DB.prepare(
-    `INSERT INTO settings (key, value, updated_at) VALUES ('worker_cache_generation', '1', ?)
-     ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), updated_at = excluded.updated_at`,
-  ).bind(now()).run();
 }
 
 export async function getVersion(env: Bindings, packageName: string, versionName: string): Promise<VersionRow | null> {

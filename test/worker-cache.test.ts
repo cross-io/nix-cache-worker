@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 import { isWorkerCacheEligible, workerCacheKey } from "../src/storage/worker-cache";
 
 describe("Worker Cache API helpers", () => {
-  it("uses a credential-free pathname key with a cache generation", () => {
+  it("uses a credential-free pathname key without a cache generation", () => {
     const request = new Request("https://cache.test/nar/example.nar?download=1", {
       headers: { Authorization: "Bearer should-not-be-in-key" },
     });
-    const key = new URL(workerCacheKey(request, "12").url);
+    const key = new URL(workerCacheKey(request).url);
     expect(key.pathname).toBe("/nar/example.nar");
-    expect(key.search).toBe("?__nix_cache_generation=12");
+    expect(key.search).toBe("");
     expect(key.username).toBe("");
     expect(key.password).toBe("");
   });

@@ -96,8 +96,7 @@ case "$url" in
     if [[ "$count" == "1" ]]; then
       printf '{"error":"retry"}' > "$output"; printf '503'
     else
-      identifier="$(printf '%032d' "$count")"
-      printf '{"uploadId":"00000000-0000-0000-0000-%012d","uploadUrl":"https://ffe78ad8ba17aa52f57892f8eda2a903.r2.cloudflarestorage.com/_nix_uploads/test?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=private","uploadHeaders":{"Content-Type":"application/octet-stream","If-None-Match":"*"}}' "$count" > "$output"
+      printf '{"key":"nar/test.nar","size":10,"sha256":"%064d","uploadUrl":"https://ffe78ad8ba17aa52f57892f8eda2a903.r2.cloudflarestorage.com/nix-cache-test/nar/test.nar?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=private","uploadHeaders":{"Content-Type":"application/octet-stream","If-None-Match":"*","Cache-Control":"public, max-age=31536000, immutable"}}' "$count" > "$output"
       printf '201'
     fi
     ;;
@@ -107,7 +106,7 @@ case "$url" in
     count=$((count + 1)); printf '%s' "$count" > "$count_file"
     printf 'api-complete\n' >> "$TEST_CURL_LOG"
     if [[ "$count" == "1" ]]; then
-      printf '{"error":{"code":"upload_not_ready"}}' > "$output"; printf '409'
+      printf '{"error":{"code":"upload_not_found"}}' > "$output"; printf '424'
     else
       printf '{"status":"completed"}' > "$output"; printf '201'
     fi

@@ -2,8 +2,7 @@ import { Hono } from "hono";
 import type { AppEnv } from "../env";
 import { AppError } from "../domain/errors";
 import { emitAudit } from "../observability";
-import { bumpCacheGeneration, getVersion, now, parseTags, type VersionRow } from "../storage/db";
-import { claimObjectWrite, releaseObjectWrite } from "../storage/r2";
+import { getVersion, now, parseTags, type VersionRow } from "../storage/db";
 import { requireRole } from "../middleware/auth";
 
 export const versionRoutes = new Hono<AppEnv>();
@@ -96,62 +95,68 @@ versionRoutes.put("/api/packages/:packageName/versions/:versionName", requireRol
   const members = await assertMembers(c.env, body.narinfoKeys);
   const tags = validateTags(body.tags);
   const retentionDays = validateNonNegativeInteger(body.retentionDays, "retention_days");
-  const versionLockKey = `version-lock/${packageName}/${versionName}`;
-  const versionOwner = await claimObjectWrite(c.env, versionLockKey);
-  if (!versionOwner) throw new AppError("version_update_in_progress", "Another registration for this version is in progress", 409);
-  try {
-    const timestamp = now();
-    const existing = await getVersion(c.env, packageName, versionName);
-    if (existing?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
-    const requestedVersionId = existing?.version_id ?? crypto.randomUUID();
-    const registeredAt = timestamp;
-
-    await c.env.DB.prepare(
+  const timestamp = now();
+  const existing = await getVersion(c.env, packageName, versionName);
+  if (existing?.state === "deleting") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+  const requestedVersionId = existing?.version_id ?? crypto.randomUUID();
+  const registeredAt = timestamp;
+  const lockResult = await c.env.DB.batch([
+    c.env.DB.prepare(
       `INSERT INTO artifact_packages (package_name, created_at, updated_at) VALUES (?, ?, ?)
        ON CONFLICT(package_name) DO UPDATE SET updated_at = excluded.updated_at`,
-    ).bind(packageName, timestamp, timestamp).run();
-    const lockResult = await c.env.DB.prepare(
+    ).bind(packageName, timestamp, timestamp),
+    c.env.DB.prepare(
       `INSERT INTO artifact_versions (version_id, package_name, version_name, tags_json, retention_days, pinned, registered_at, updated_at, state)
-       VALUES (?, ?, ?, ?, ?, COALESCE((SELECT pinned FROM artifact_versions WHERE version_id = ?), 0), ?, ?, 'registering')
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'registering')
        ON CONFLICT(package_name, version_name) DO UPDATE SET tags_json = excluded.tags_json,
          retention_days = excluded.retention_days, registered_at = excluded.registered_at,
-         updated_at = excluded.updated_at,
-         state = 'registering'
+         updated_at = excluded.updated_at, state = 'registering'
        WHERE artifact_versions.state != 'deleting'`,
-    ).bind(requestedVersionId, packageName, versionName, JSON.stringify(tags), retentionDays, requestedVersionId, registeredAt, timestamp).run();
-    if (lockResult.meta.changes !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
-    const locked = await getVersion(c.env, packageName, versionName);
-    if (!locked || locked.state !== "registering") throw new AppError("version_deleting", "The version is currently being deleted", 409);
-    const versionId = locked.version_id;
+    ).bind(requestedVersionId, packageName, versionName, JSON.stringify(tags), retentionDays, existing?.pinned ?? 0, registeredAt, timestamp),
+  ]);
+  if ((lockResult[1]?.meta.changes ?? 0) !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
+  const locked = await getVersion(c.env, packageName, versionName);
+  if (!locked || locked.state !== "registering") throw new AppError("version_deleting", "The version is currently being deleted", 409);
+  const versionId = locked.version_id;
 
-    await c.env.DB.prepare("DELETE FROM artifact_version_members WHERE version_id = ?").bind(versionId).run();
-    for (let offset = 0; offset < members.length; offset += 100) {
-      const statements = members.slice(offset, offset + 100).map((key) => c.env.DB.prepare(
-        `INSERT INTO artifact_version_members (version_id, narinfo_key)
-         SELECT ?, ?
-         WHERE EXISTS (
-           SELECT 1
-           FROM objects ni
+  // Membership counters are adjusted in the same D1 batch as the membership
+  // replacement. Inserts are chunked only to stay below D1's statement limit.
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE objects SET version_member_count = MAX(0, version_member_count - (
+         SELECT COUNT(*) FROM artifact_version_members m WHERE m.version_id = ? AND m.narinfo_key = objects.r2_key
+       )) WHERE kind = 'narinfo' AND r2_key IN (SELECT narinfo_key FROM artifact_version_members WHERE version_id = ?)`,
+    ).bind(versionId, versionId),
+    c.env.DB.prepare("DELETE FROM artifact_version_members WHERE version_id = ?").bind(versionId),
+  ]);
+  for (let offset = 0; offset < members.length; offset += 50) {
+    const statements = [];
+    for (const key of members.slice(offset, offset + 50)) {
+      statements.push(c.env.DB.prepare(
+        `INSERT OR IGNORE INTO artifact_version_members (version_id, narinfo_key)
+         SELECT ?, ? WHERE EXISTS (
+           SELECT 1 FROM objects ni
            JOIN narinfo_refs r ON r.narinfo_key = ni.r2_key
            JOIN objects n ON n.r2_key = r.nar_key
            WHERE ni.r2_key = ? AND ni.kind = 'narinfo' AND ni.state = 'ready'
              AND n.kind = 'nar' AND n.state = 'ready'
          )`,
       ).bind(versionId, key, key));
-      await c.env.DB.batch(statements);
+      statements.push(c.env.DB.prepare(
+        `UPDATE objects SET version_member_count = version_member_count + 1
+         WHERE r2_key = ? AND kind = 'narinfo' AND changes() = 1`,
+      ).bind(key));
     }
-    const memberCount = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM artifact_version_members WHERE version_id = ?")
-      .bind(versionId).first<{ count: number }>();
-    if (Number(memberCount?.count ?? 0) !== members.length) {
-      throw new AppError("missing_narinfo", "One or more narinfo dependencies changed while registering the version", 424);
-    }
-    const activated = await c.env.DB.prepare("UPDATE artifact_versions SET state = 'active', updated_at = ? WHERE version_id = ? AND state = 'registering'")
-      .bind(timestamp, versionId).run();
-    if (activated.meta.changes !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
-    await bumpCacheGeneration(c.env);
-    await emitAudit(c.env, existing ? "version_update" : "version_create", c.get("role"), `${packageName}/${versionName}`, { versionId, members: members.length, tags });
-    return c.json({ versionId, packageName, versionName, tags, narinfoKeys: members, retentionDays, pinned: Boolean(locked.pinned), registeredAt }, existing ? 200 : 201);
-  } finally {
-    await releaseObjectWrite(c.env, versionLockKey, versionOwner);
+    await c.env.DB.batch(statements);
   }
+  const memberCount = await c.env.DB.prepare("SELECT COUNT(*) AS count FROM artifact_version_members WHERE version_id = ?")
+    .bind(versionId).first<{ count: number }>();
+  if (Number(memberCount?.count ?? 0) !== members.length) {
+    throw new AppError("missing_narinfo", "One or more narinfo dependencies changed while registering the version", 424);
+  }
+  const activated = await c.env.DB.prepare("UPDATE artifact_versions SET state = 'active', updated_at = ? WHERE version_id = ? AND state = 'registering'")
+    .bind(timestamp, versionId).run();
+  if (activated.meta.changes !== 1) throw new AppError("version_deleting", "The version is currently being deleted", 409);
+  await emitAudit(c.env, existing ? "version_update" : "version_create", c.get("role"), `${packageName}/${versionName}`, { versionId, members: members.length, tags });
+  return c.json({ versionId, packageName, versionName, tags, narinfoKeys: members, retentionDays, pinned: Boolean(locked.pinned), registeredAt }, existing ? 200 : 201);
 });

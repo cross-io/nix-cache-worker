@@ -136,11 +136,13 @@ write_direct_curl_config() {
   local upload_url="$2"
   local content_type="$3"
   local if_none_match="$4"
-  local nar_file="$5"
+  local cache_control="$5"
+  local nar_file="$6"
 
-  [[ "$upload_url" =~ ^https://[[:xdigit:]]{32}\.r2\.cloudflarestorage\.com/ ]] || die "upload session returned an unexpected R2 URL"
-  [[ "$content_type" == "application/octet-stream" ]] || die "upload session returned an unexpected Content-Type"
-  [[ "$if_none_match" == "*" ]] || die "upload session returned an unexpected If-None-Match value"
+  [[ "$upload_url" =~ ^https://[[:xdigit:]]{32}\.r2\.cloudflarestorage\.com/ ]] || die "direct upload returned an unexpected R2 URL"
+  [[ "$content_type" == "application/octet-stream" ]] || die "direct upload returned an unexpected Content-Type"
+  [[ "$if_none_match" == "*" ]] || die "direct upload returned an unexpected If-None-Match value"
+  [[ "$cache_control" == "public, max-age=31536000, immutable" ]] || die "direct upload returned an unexpected Cache-Control value"
 
   : > "$config_file"
   chmod 600 "$config_file"
@@ -149,6 +151,7 @@ write_direct_curl_config() {
   curl_config_line "$config_file" 'request' 'PUT'
   curl_config_line "$config_file" 'header' "Content-Type: $content_type"
   curl_config_line "$config_file" 'header' "If-None-Match: $if_none_match"
+  curl_config_line "$config_file" 'header' "Cache-Control: $cache_control"
   curl_config_line "$config_file" 'upload-file' "$nar_file"
 }
 
@@ -156,7 +159,7 @@ initialize_upload() {
   local nar_key="$1"
   local nar_size="$2"
   local nar_sha256="$3"
-  local response_file="$temporary_directory/upload-session.json"
+  local response_file="$temporary_directory/upload-spec.json"
   local request_file="$temporary_directory/upload-request.json"
   local attempt status
 
@@ -176,38 +179,47 @@ initialize_upload() {
       retry_delay "$attempt"
       continue
     fi
-    die "could not create a direct upload session for $nar_key (HTTP $status)"
+    die "could not create a direct upload URL for $nar_key (HTTP $status)"
   done
 }
 
 complete_upload() {
-  local upload_id="$1"
+  local nar_key="$1"
+  local nar_size="$2"
+  local nar_sha256="$3"
   local response_file="$temporary_directory/upload-complete.json"
+  local request_file="$temporary_directory/upload-complete-request.json"
   local attempt status
 
+  jq --null-input --compact-output \
+    --arg key "$nar_key" \
+    --arg sha256 "$nar_sha256" \
+    --argjson size "$nar_size" \
+    '{key: $key, size: $size, sha256: $sha256}' > "$request_file"
+
   for ((attempt = 0; attempt <= retry_count; attempt++)); do
-    status="$(api_request POST "$cache_url/api/uploads/$upload_id/complete" "$response_file")"
+    status="$(api_request POST "$cache_url/api/uploads/complete" "$response_file" "$request_file")"
     if [[ "$status" == "200" || "$status" == "201" ]]; then
       return 0
     fi
     if [[ "$attempt" -lt "$retry_count" ]]; then
       if retryable_status "$status" || {
-        [[ "$status" == "409" ]] && jq --exit-status --raw-output \
-          '(.error.code // "") == "upload_not_ready" or (.error.code // "") == "upload_in_progress"' \
+        [[ "$status" == "409" || "$status" == "424" ]] && jq --exit-status --raw-output \
+          '(.error.code // "") == "upload_not_found" or (.error.code // "") == "upload_in_progress"' \
           "$response_file" >/dev/null 2>&1
       }; then
         retry_delay "$attempt"
         continue
       fi
     fi
-    die "could not complete direct upload $upload_id (HTTP $status)"
+    die "could not complete direct upload $nar_key (HTTP $status)"
   done
 }
 
 upload_nar() {
   local nar_key="$1"
   local nar_file="$2"
-  local nar_size nar_sha256 session already_exists upload_id upload_url content_type if_none_match
+  local nar_size nar_sha256 session already_exists upload_url content_type if_none_match cache_control
   local direct_config response_file attempt status
 
   nar_size="$(wc -c < "$nar_file" | tr -d '[:space:]')"
@@ -218,25 +230,25 @@ upload_nar() {
 
   printf 'Preparing direct upload for %s (%s bytes)\n' "$nar_key" "$nar_size"
   session="$(initialize_upload "$nar_key" "$nar_size" "$nar_sha256")"
-  already_exists="$(jq --raw-output 'if .alreadyExists == true then "true" else "false" end' <<< "$session")" || die "upload session response was not valid JSON"
+  already_exists="$(jq --raw-output 'if .alreadyExists == true then "true" else "false" end' <<< "$session")" || die "direct upload response was not valid JSON"
   if [[ "$already_exists" == "true" ]]; then
     printf 'NAR already exists: %s\n' "$nar_key"
     return 0
   fi
 
-  upload_id="$(jq --exit-status --raw-output '.uploadId // empty' <<< "$session")" || die "upload session did not contain uploadId"
-  upload_url="$(jq --exit-status --raw-output '.uploadUrl // empty' <<< "$session")" || die "upload session did not contain uploadUrl"
-  content_type="$(jq --exit-status --raw-output '.uploadHeaders["Content-Type"] // empty' <<< "$session")" || die "upload session did not contain Content-Type"
-  if_none_match="$(jq --exit-status --raw-output '.uploadHeaders["If-None-Match"] // empty' <<< "$session")" || die "upload session did not contain If-None-Match"
-  [[ -n "$upload_id" && -n "$upload_url" && -n "$content_type" && -n "$if_none_match" ]] || die "upload session response was incomplete"
+  upload_url="$(jq --exit-status --raw-output '.uploadUrl // empty' <<< "$session")" || die "direct upload response did not contain uploadUrl"
+  content_type="$(jq --exit-status --raw-output '.uploadHeaders["Content-Type"] // empty' <<< "$session")" || die "direct upload response did not contain Content-Type"
+  if_none_match="$(jq --exit-status --raw-output '.uploadHeaders["If-None-Match"] // empty' <<< "$session")" || die "direct upload response did not contain If-None-Match"
+  cache_control="$(jq --exit-status --raw-output '.uploadHeaders["Cache-Control"] // empty' <<< "$session")" || die "direct upload response did not contain Cache-Control"
+  [[ -n "$upload_url" && -n "$content_type" && -n "$if_none_match" && -n "$cache_control" ]] || die "direct upload response was incomplete"
 
-  direct_config="$temporary_directory/direct-$upload_id.curl"
-  write_direct_curl_config "$direct_config" "$upload_url" "$content_type" "$if_none_match" "$nar_file"
+  direct_config="$temporary_directory/direct-$nar_size-$nar_sha256.curl"
+  write_direct_curl_config "$direct_config" "$upload_url" "$content_type" "$if_none_match" "$cache_control" "$nar_file"
   response_file="$temporary_directory/direct-response"
   for ((attempt = 0; attempt <= retry_count; attempt++)); do
     status="$(curl_status "$response_file" --config "$direct_config")"
     if [[ "$status" =~ ^2[0-9][0-9]$ || "$status" == "412" ]]; then
-      complete_upload "$upload_id"
+      complete_upload "$nar_key" "$nar_size" "$nar_sha256"
       printf 'NAR completed: %s\n' "$nar_key"
       return 0
     fi

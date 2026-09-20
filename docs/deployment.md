@@ -1,12 +1,11 @@
 # Deployment guide
 
-This guide deploys Nix Cache Worker to Cloudflare Workers with R2, D1, Worker
-Secrets, and an every-eight-hours garbage-collection trigger. The application does not
-create or modify Cloudflare bindings and Secrets through its web console.
+This deployment intentionally rebuilds the cache. It accepts clearing the D1
+database, all R2 objects, old CDN entries, and all old staging data.
 
 ## Prerequisites
 
-Install Node.js and npm, create or select a Cloudflare account, and authenticate
+Install Node.js, create or select a Cloudflare account, and authenticate
 Wrangler:
 
 ```bash
@@ -14,157 +13,137 @@ npm install
 npx wrangler login
 ```
 
-The account needs permission to create or use Workers, R2, D1, and Worker
-Secrets. Do not add a Cloudflare API credential to the Worker itself.
+The account needs Workers, R2, D1, and Worker Secret permissions. The Worker
+does not need a Cloudflare API credential.
 
-## 1. Initialize the private Wrangler file
+## 1. Create the resources
 
-The public repository contains a safe template, not a deployable personal
-configuration:
+Create a new R2 bucket and a new D1 database when possible. Otherwise, use
+read-only inspection and explicitly clear the existing deployment before
+continuing:
+
+```bash
+npx wrangler r2 bucket create <R2_BUCKET_NAME>
+npx wrangler d1 create <D1_DATABASE_NAME>
+```
+
+Copy and edit the ignored deployment file:
 
 ```bash
 cp wrangler.jsonc.example wrangler.jsonc
 ```
 
-Edit the ignored `wrangler.jsonc` and set:
+Set the Worker name, R2 bucket, D1 database ID, account ID, presigned URL
+TTLs, cache-info values, and optional public Nix signing key.
 
-1. `name` to the Worker name you want to deploy.
-2. `CACHE_BUCKET` to an R2 bucket dedicated to this cache.
-3. `DB` to the D1 database name and IDs for the target environment.
-4. `NIX_PUBLIC_SIGN_KEY` to the public key used by your signed narinfos, if
-   signature verification is enabled.
-5. `R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, and optionally
-   `DIRECT_UPLOAD_URL_TTL_SECONDS` for large direct NAR uploads and
-   `DIRECT_DOWNLOAD_URL_TTL_SECONDS` for direct R2 cache reads.
-6. An optional custom-domain route in the Cloudflare Dashboard or in the
-   private Wrangler file.
+## 2. Clear the old deployment
 
-The example uses placeholder resource names and the all-zero UUID only to make
-the required fields obvious. Replace every placeholder before a remote
-operation. The private `wrangler.jsonc` is ignored by `.gitignore`; do not
-force-add it.
+Before applying the new schema, remove all old R2 objects, including
+`_nix_uploads/`, and clear the old D1 database. The exact commands depend on
+the account and are deliberately operator-confirmed. For a new D1 database
+and bucket, this step is naturally satisfied.
 
-For local development, initialize the ignored secret file if needed:
+Do not retain old migration history or try to apply `0002`, `0003`, or `0004`.
+The new repository contains only `migrations/0001_initial.sql`.
 
-```bash
-cp .dev.vars.example .dev.vars
-```
-
-## 2. Create or select Cloudflare resources
-
-Create an R2 bucket and a D1 database in the target Cloudflare account, or use
-existing dedicated resources. Put their names and the D1 UUID in the private
-Wrangler file. Keep production and preview/local resources separate when the
-deployment workflow requires isolation.
-
-The D1 binding must use `migrations_dir: "migrations"`. The Cron trigger in the
-template runs at 00:00, 08:00, and 16:00 UTC and enqueues bounded GC work. The
-direct-upload feature adds the forward-only
-`0004_presigned_upload_sessions.sql` migration.
-
-## 3. Apply D1 migrations
-
-Use the exact database name from the private Wrangler file:
+## 3. Apply the single schema
 
 ```bash
 npx wrangler d1 migrations apply <D1_DATABASE_NAME> --remote
 ```
 
-For local development, use the local binding instead:
+The migration creates object indexes, reference counters, package/version
+membership, policies, persistent jobs, combined `job_object_items`, GC
+snapshots, and audit records. It does not create `settings`, `write_claims`,
+`upload_sessions`, or the old split deletion tables.
+
+## 4. Configure secrets and deploy
 
 ```bash
-npx wrangler d1 migrations apply <D1_DATABASE_NAME> --local
-```
-
-Migrations are forward-only. Review the migration list before applying it to a
-database that already contains production data.
-
-Existing deployments must complete the pre-squash migration chain before using
-this repository version. Check the migration list from the previous revision;
-an environment that has only applied the old `0001` or `0002` must first run
-the old `0003` and `0004` migrations from that revision. Do not run the new
-baseline against a partially migrated database. Fresh local state can apply
-the single baseline directly.
-
-## 4. Configure Worker Secrets
-
-Set all three roles separately. Wrangler prompts for each value without placing
-it in the repository:
-
-```bash
-npx wrangler secret put READ_TOKEN
 npx wrangler secret put WRITE_TOKEN
 npx wrangler secret put ADMIN_TOKEN
 npx wrangler secret put R2_S3_ACCESS_KEY_ID
 npx wrangler secret put R2_S3_SECRET_ACCESS_KEY
-```
-
-Use long, independently generated values. Keep them in the CI secret store or
-password manager and do not put them in `vars`, D1, URLs, netrc files checked
-into source control, screenshots, or logs.
-
-## 5. Deploy
-
-Run the supported deployment command:
-
-```bash
+# Configure READ_TOKEN only if Worker-authenticated reads are required.
+npx wrangler secret put READ_TOKEN
 npx wrangler deploy
 ```
 
-`npm run build` is only a dry-run build and does not publish a Worker. The
-deployment output should show the expected Worker, R2 binding, D1 binding, and
-Cron trigger.
+The R2 S3 token must be scoped to the cache bucket and allow object reads and
+writes needed for presigning. Keep all secret values out of source, D1, URLs,
+logs, and persistent browser storage.
 
-## 6. Configure a custom domain and Nix signing
+## 5. Choose a read entry point
 
-Attach an HTTPS custom domain through Cloudflare after the Worker is deployed,
-or configure the route in the private Wrangler file. The UI derives examples
-from the request origin, so it does not require a hostname in tracked source.
+If `READ_TOKEN` is empty, either use the Worker origin (which returns
+presigned redirects) or attach an R2 Custom Domain. The Custom Domain is the
+lowest-cost anonymous download path because it avoids Worker invocations.
 
-If narinfos are signed, set `NIX_PUBLIC_SIGN_KEY` to the matching public key,
-deploy again, and verify that the public `/` page displays the expected key.
-Never upload or commit the corresponding private signing key.
+If `READ_TOKEN` is non-empty, do not enable a public R2 Custom Domain. All
+cache reads must enter through the Worker so it can enforce the read token.
+The Worker redirects without querying D1 or calling R2 `HEAD`; R2 returns the
+final 200/206/304/404/412 response.
 
-For direct NAR uploads and optional direct cache reads, create the R2 S3 API
-token with object read/write permissions scoped to the cache bucket. Presigned
-URLs use the R2 S3 API hostname, not the Worker custom domain. Keep their URLs
-out of logs and CI output.
+For a Custom Domain, add a Cache Rule for `/nix-cache-info`, `/*.narinfo`, and
+`/nar/*` with an approximately one-year edge TTL and cached 404s. This design
+accepts stale reads after deletion and does not issue generation invalidations.
 
-## 7. Verify the deployment
+## 6. Publish cache-info for R2 Custom Domain
 
-Check the following in order:
+The Worker-generated response is:
 
-```bash
-curl -fsS https://cache.example.org/nix-cache-info
-curl -i https://cache.example.org/
+```text
+StoreDir: <DEFAULT_STORE_DIR>
+WantMassQuery: <DEFAULT_WANT_MASS_QUERY>
+Priority: <DEFAULT_PRIORITY>
 ```
 
-Then log in at `/admin`, confirm the settings and seeded retention rule, and
-perform an end-to-end test from a controlled Nix client:
+Write those exact bytes to the R2 key `nix-cache-info` using the deployment
+command in [`configuration.md`](configuration.md), with
+`public, max-age=31536000, immutable` metadata.
 
-1. Upload an ordinary-sized NAR with `nix copy --to` using a temporary netrc
-   whose file mode is `0600` to verify stock compatibility.
-2. Run `bin/nix-cache-upload --to <origin> --package <name> --version <name>
-   <installable>` with `NIX_CACHE_WRITE_TOKEN` or `--token-file`. It uploads
-   NARs directly to R2, then publishes narinfos and registers the version.
-3. Read the result with `nix copy --from` or `nix store cat --store`; when
-   direct reads are enabled, verify that Nix follows the short-lived R2
-   redirect.
-4. Test a Range request and inspect the Worker logs for safe structured events.
-
-Replace `cache.example.org` with the real HTTPS hostname. Do not paste real
-tokens into these commands or into documentation.
-
-## Updating an existing deployment
-
-Keep the existing ignored `wrangler.jsonc`, review source and migration
-changes, apply any new D1 migration, and deploy:
+## 7. Smoke test
 
 ```bash
-npx wrangler d1 migrations apply <D1_DATABASE_NAME> --remote
-npx wrangler deploy
+curl -i https://cache.example.org/nix-cache-info
+curl -i -H "Authorization: Bearer $READ_TOKEN" \
+  https://cache.example.org/nar/does-not-exist.nar
+npm run typecheck
+npm test
+npm run build
 ```
 
-Rotate a Worker Secret with the same `wrangler secret put NAME` command. A
-secret rotation does not require a D1 migration. Keep old and new credentials
-coordinated with CI and Nix clients during the transition.
+Then upload one NAR, upload its narinfo, register a version, and test a range
+read. Use the admin console only for package/version/policy/pin/GC operations;
+deployment values are changed in Wrangler and require redeployment.
+
+## 8. Direct upload operation
+
+The direct flow is stateless and uses the final key:
+
+```bash
+curl --fail-with-body -X POST https://cache.example.org/api/uploads \
+  -H "Authorization: Bearer $WRITE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"nar/example.nar","size":123,"sha256":"<sha256>"}'
+
+curl --fail-with-body -X POST https://cache.example.org/api/uploads/complete \
+  -H "Authorization: Bearer $WRITE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"nar/example.nar","size":123,"sha256":"<sha256>"}'
+```
+
+The first response supplies the presigned PUT URL and required headers. PUT the
+file to that URL before calling completion. A wrong digest or size is removed
+automatically. There are no staging sessions to expire or clean up.
+
+## Operations and recovery
+
+Cron schedules bounded GC work. Version deletion and R2 cleanup are persisted
+in D1 and safe to retry after a Worker interruption. An R2 delete failure
+leaves the object item for the next job attempt. Shared NARs remain protected
+by `narinfo_ref_count` until their final reference is removed.
+
+For a future full rebuild, repeat the clear-D1/clear-R2 process and apply the
+single initial migration. This is the supported migration strategy for the
+best-effort architecture.

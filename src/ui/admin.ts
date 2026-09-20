@@ -173,7 +173,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
 
   <div class="shell hidden" id="appShell">
     <main>
-      <header class="topbar"><div><h1>Nix Cache Admin</h1></div><div class="top-actions"><nav class="admin-nav" aria-label="Admin sections"><a class="button small" href="#packages">Packages</a><a class="button small" href="#policies">Retention</a><a class="button small" href="#settings">Settings</a><a class="button small" href="#publishing">Publishing</a></nav><div class="connected">Connected</div></div></header>
+      <header class="topbar"><div><h1>Nix Cache Admin</h1></div><div class="top-actions"><nav class="admin-nav" aria-label="Admin sections"><a class="button small" href="#packages">Packages</a><a class="button small" href="#policies">Retention</a><a class="button small" href="#publishing">Publishing</a></nav><div class="connected">Connected</div></div></header>
       <section class="stats" aria-label="Cache overview">
         <div class="stat"><div class="stat-label">Packages</div><div class="stat-value" id="statPackages">—</div></div>
         <div class="stat"><div class="stat-label">Versions</div><div class="stat-value" id="statVersions">—</div></div>
@@ -220,11 +220,7 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
         <div class="policy-list" id="policyList"></div>
       </section>
 
-      <section class="panel" id="settings">
-        <div class="panel-head"><div><h2>Cache settings</h2><p class="subtle">Defaults returned by <code>/nix-cache-info</code> and used by retention.</p></div></div>
-        <div class="form-grid"><div class="field"><label for="store_dir">Store directory</label><input id="store_dir"></div><div class="field"><label for="priority">Priority</label><input id="priority"></div><div class="field"><label for="want_mass_query">WantMassQuery</label><input id="want_mass_query"></div><div class="field"><label for="default_retention_days">Default retention days</label><input id="default_retention_days"></div></div>
-        <button class="button primary" id="saveSettings" type="button">Save settings</button>
-      </section>
+      <section class="panel" id="settings"><div class="panel-head"><div><h2>Deployment settings</h2><p class="subtle">Cache-info values and default retention are deployment environment variables. Change them with Wrangler and redeploy.</p></div></div></section>
       <section class="panel publisher-panel" id="publishing">
         <div class="panel-head"><div><div class="eyebrow">For publishers</div><h2>CI publishing</h2><p class="subtle">Publish build outputs through Nix's standard HTTP copy protocol. Keep the write token in your CI secret store.</p></div><span class="connected">Write access</span></div>
         <div class="publisher-grid">
@@ -671,13 +667,12 @@ export function adminPage(publicOrigin = DEFAULT_CACHE_ORIGIN): Response {
         list.append(item);
       }
     }
-    async function load() { try { const [packages, overview, settings, policies] = await Promise.all([api("/api/admin/packages?q=" + encodeURIComponent($("query").value)), api("/api/admin/overview"), api("/api/admin/settings"), api("/api/admin/policies")]); renderStats(overview); packagesData = packages; renderPackages(packages); renderPolicies(policies); for (const key of ["store_dir", "priority", "want_mass_query", "default_retention_days"]) $(key).value = settings[key] || ""; setDurationDefault(settings.default_retention_days); setMessage("Showing " + packages.items.length + " of " + packages.total + " packages", "success"); } catch (error) { setMessage(error.message, "error"); throw error; } }
-    async function openConsole(candidate) { token = candidate.trim(); if (!token) return; $("login").disabled = true; try { await api("/api/admin/settings"); storeToken(token); $("token").value = ""; $("loginPanel").classList.add("hidden"); $("appShell").classList.remove("hidden"); await load(); } catch (error) { clearStoredToken(); token = ""; $("loginPanel").classList.remove("hidden"); $("appShell").classList.add("hidden"); setLoginMessage(error.message, "error"); } finally { $("login").disabled = false; } }
+    async function load() { try { const [packages, overview, policies] = await Promise.all([api("/api/admin/packages?q=" + encodeURIComponent($("query").value)), api("/api/admin/overview"), api("/api/admin/policies")]); renderStats(overview); packagesData = packages; renderPackages(packages); renderPolicies(policies); setDurationDefault("7"); setMessage("Showing " + packages.items.length + " of " + packages.total + " packages", "success"); } catch (error) { setMessage(error.message, "error"); throw error; } }
+    async function openConsole(candidate) { token = candidate.trim(); if (!token) return; $("login").disabled = true; try { await api("/api/admin/overview"); storeToken(token); $("token").value = ""; $("loginPanel").classList.add("hidden"); $("appShell").classList.remove("hidden"); await load(); } catch (error) { clearStoredToken(); token = ""; $("loginPanel").classList.remove("hidden"); $("appShell").classList.add("hidden"); setLoginMessage(error.message, "error"); } finally { $("login").disabled = false; } }
     $("login").onclick = () => openConsole($("token").value);
     $("token").onkeydown = (event) => { if (event.key === "Enter") $("login").click(); };
     $("refresh").onclick = () => load(); $("query").onkeydown = (event) => { if (event.key === "Enter") load(); };
     $("gc").onclick = async () => { $("gc").disabled = true; try { const result = await api("/api/admin/gc", { method: "POST" }); setMessage((result.reused ? "GC already scheduled · " : "GC started · ") + result.jobId, "success"); const job = await waitForJob(result.jobId); if (job) { setMessage("GC scan completed · queued deletions may continue", "success"); await load(); } else setMessage("GC is still running; refresh again shortly", "success"); } catch (error) { setMessage(error.message, "error"); } finally { $("gc").disabled = false; } };
-    $("saveSettings").onclick = async () => { try { await api("/api/admin/settings", { method: "PUT", body: JSON.stringify({ store_dir: $("store_dir").value, priority: $("priority").value, want_mass_query: $("want_mass_query").value, default_retention_days: $("default_retention_days").value }) }); setDurationDefault($("default_retention_days").value); setMessage("Cache settings saved", "success"); } catch (error) { setMessage(error.message, "error"); } };
     $("savePolicy").onclick = async () => { try { const draft = readPolicyDraft(); const payload = { name: $("policy_name").value.trim(), ...draft }; await api(editingPolicyId == null ? "/api/admin/policies" : "/api/admin/policies/" + editingPolicyId, { method: editingPolicyId == null ? "POST" : "PUT", body: JSON.stringify(payload) }); closePolicyEditor(); setMessage("Retention rule saved", "success"); await load(); } catch (error) { setMessage(error.message, "error"); } };
     $("togglePolicyEditor").onclick = () => openPolicyEditor();
     $("cancelPolicy").onclick = closePolicyEditor;

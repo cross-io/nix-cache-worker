@@ -9,9 +9,9 @@ that build packages and publish them to a private, policy-managed cache.
 It supports:
 
 - standard `nix copy --to` and `nix copy --from` workflows;
-- public cache reads with authenticated writes;
+- optional anonymous or read-token-protected cache reads with authenticated writes;
 - a zero-compile Nix publishing client with direct-to-R2 NAR uploads;
-- optional presigned R2 redirects for cache-object reads;
+- low-cost R2 Custom Domain reads or presigned R2 redirects through the Worker;
 - package and build-version organization with tags;
 - retention policies, pins, and bounded garbage collection;
 - an authenticated web console for operations and administration.
@@ -33,6 +33,7 @@ schema, configure Worker Secrets, and deploy:
 ```bash
 npx wrangler login
 npx wrangler d1 migrations apply <D1_DATABASE_NAME> --remote
+# Optional: configure this only when Worker-authenticated reads are required.
 npx wrangler secret put READ_TOKEN
 npx wrangler secret put WRITE_TOKEN
 npx wrangler secret put ADMIN_TOKEN
@@ -55,8 +56,8 @@ The admin console is available at `/admin`. It manages package versions,
 retention rules, pins, garbage collection, and persistent deletion jobs.
 
 For CI publishing, use [`bin/nix-cache-upload`](bin/nix-cache-upload). It
-exports a standard local Nix file cache, sends every NAR directly to R2 through
-an authenticated presigned session, publishes narinfo only after completion,
+exports a standard local Nix file cache, sends every NAR directly to its final
+R2 key through an authenticated presigned URL, publishes narinfo only after completion,
 and registers the requested package/version. This does not change the standard
 `nix copy --to` protocol.
 
@@ -67,11 +68,17 @@ NIX_CACHE_WRITE_TOKEN=... bin/nix-cache-upload \
   nixpkgs#hello
 ```
 
-Deployments may also set `DIRECT_DOWNLOAD_URL_TTL_SECONDS` to redirect
-supported NAR and narinfo GET/HEAD requests to short-lived R2 URLs. Stock Nix
-clients follow those redirects, so R2 supplies the authoritative object,
-Range, and conditional response directly. Missing objects and older objects
-with pre-existing R2 cache metadata remain on the Worker read path.
+When `READ_TOKEN` is empty, deployments may use either an R2 Custom Domain or
+the Worker redirect path for anonymous reads. When `READ_TOKEN` is non-empty,
+all cache reads must enter through the Worker and a public R2 Custom Domain
+must not be enabled. The Worker validates the key, performs no D1 lookup or
+R2 `HEAD`, and returns a `307` presigned R2 URL; R2 supplies the final status,
+Range, ETag, and conditional response. Redirects are `no-store`.
+
+NAR and narinfo objects use `public, max-age=31536000, immutable`. Deletion is
+best effort for CDN, browser, and presigned-URL caches, so stale content after
+deletion is accepted. See [`docs/architecture.md`](docs/architecture.md) and
+RFC-0021 for the full design.
 
 ## Development
 
