@@ -9,6 +9,14 @@ import { emitWorkerCacheHit, matchWorkerCache, responseForRequestMethod, schedul
 
 export const cacheRoutes = new Hono<AppEnv>();
 
+function cacheInfoVariant(env: AppEnv["Bindings"]): string {
+  return [
+    env.DEFAULT_STORE_DIR ?? "/nix/store",
+    env.DEFAULT_WANT_MASS_QUERY ?? "1",
+    env.DEFAULT_PRIORITY ?? "40",
+  ].join("\u0000");
+}
+
 cacheRoutes.use("/*", requireCacheRead());
 
 cacheRoutes.on(["GET", "HEAD"], "/nix-cache-info", async (c) => {
@@ -16,7 +24,8 @@ cacheRoutes.on(["GET", "HEAD"], "/nix-cache-info", async (c) => {
   const priority = c.env.DEFAULT_PRIORITY ?? "40";
   const wantMassQuery = c.env.DEFAULT_WANT_MASS_QUERY ?? "1";
   const body = `StoreDir: ${storeDir}\nWantMassQuery: ${wantMassQuery}\nPriority: ${priority}\n`;
-  const cached = await matchWorkerCache(c.req.raw);
+  const variant = cacheInfoVariant(c.env);
+  const cached = await matchWorkerCache(c.req.raw, variant);
   if (cached) {
     emitWorkerCacheHit("nix-cache-info", "cache-info", c.req.raw, cached);
     return responseForRequestMethod(cached, c.req.method);
@@ -27,7 +36,7 @@ cacheRoutes.on(["GET", "HEAD"], "/nix-cache-info", async (c) => {
     "Content-Length": String(new TextEncoder().encode(body).byteLength),
   });
   const response = new Response(c.req.method === "HEAD" ? null : body, { status: 200, headers });
-  scheduleWorkerCachePut(c.executionCtx, c.req.raw, response);
+  scheduleWorkerCachePut(c.executionCtx, c.req.raw, response, variant);
   return response;
 });
 

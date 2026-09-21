@@ -41,7 +41,7 @@ Maintain support for:
 - Accurate `Content-Length` and `Content-Range` headers.
 - Standard `/nix-cache-info`, `.narinfo`, and `/nar/*` paths.
 - Streamed single R2 writes for ordinary standard PUTs; large NAR publishing
-  uses the explicit direct-upload session.
+  uses the stateless final-key direct-upload flow.
 
 Do not introduce a custom upload protocol as a prerequisite for normal Nix cache operation.
 

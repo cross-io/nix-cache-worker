@@ -95,7 +95,9 @@ should apply the same long edge TTL to `/nix-cache-info`, `/*.narinfo`, and
 
 The Worker returns the standard cache information document from Wrangler
 variables. It does not query D1. For an R2 Custom Domain, deployment writes
-the same bytes to the R2 `nix-cache-info` object.
+the same bytes to the R2 `nix-cache-info` object. Worker Cache keys include the
+public cache-info values, so redeploying with new values does not reuse the old
+Worker-generated response.
 
 ### NARINFO consistency
 

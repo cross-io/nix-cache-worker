@@ -47,7 +47,9 @@ stale object after deletion; this is intentional best-effort behavior.
 
 `/nix-cache-info` is generated from Wrangler variables by the Worker. For an
 R2 Custom Domain, deployment writes the same bytes to the `nix-cache-info` R2
-object. It is not stored in D1 and is not part of retention or GC.
+object. It is not stored in D1 and is not part of retention or GC. The Worker
+Cache key includes the three public cache-info values, so a configuration change
+uses a new key without reintroducing a D1 generation lookup.
 
 ## Uploads
 

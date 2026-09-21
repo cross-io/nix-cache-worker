@@ -30,14 +30,14 @@ cleanup_failed_run() {
     if [[ -n "$test_package" && -n "$test_version" ]]; then
       npx wrangler d1 execute nix-cache-testing --remote --config wrangler.integration.generated.jsonc --command "DELETE FROM artifact_version_members WHERE version_id IN (SELECT version_id FROM artifact_versions WHERE package_name = '$test_package' AND version_name = '$test_version'); UPDATE objects SET version_member_count = (SELECT COUNT(*) FROM artifact_version_members m WHERE m.narinfo_key = objects.r2_key); DELETE FROM narinfo_refs WHERE narinfo_key IN ($key_list) AND NOT EXISTS (SELECT 1 FROM artifact_version_members m WHERE m.narinfo_key = narinfo_refs.narinfo_key); UPDATE objects SET narinfo_ref_count = (SELECT COUNT(*) FROM narinfo_refs r WHERE r.nar_key = objects.r2_key); DELETE FROM artifact_versions WHERE package_name = '$test_package' AND version_name = '$test_version'; DELETE FROM artifact_packages WHERE package_name = '$test_package' AND NOT EXISTS (SELECT 1 FROM artifact_versions v WHERE v.package_name = artifact_packages.package_name);" >/dev/null 2>&1 || true
     fi
-    cleanup_keys_json="$(npx wrangler d1 execute nix-cache-testing --remote --json --config wrangler.integration.generated.jsonc --command "SELECT r2_key FROM objects WHERE r2_key IN ($key_list) AND ((kind = 'narinfo' AND version_member_count = 0 AND NOT EXISTS (SELECT 1 FROM artifact_version_members m WHERE m.narinfo_key = objects.r2_key)) OR (kind = 'nar' AND narinfo_ref_count = 0));" 2>/dev/null || true)"
+    cleanup_keys_json="$(npx wrangler d1 execute nix-cache-testing --remote --json --config wrangler.integration.generated.jsonc --command "WITH requested(r2_key) AS (VALUES ($key_list)) SELECT requested.r2_key FROM requested LEFT JOIN objects ON objects.r2_key = requested.r2_key WHERE objects.r2_key IS NULL OR ((objects.kind = 'narinfo' AND objects.version_member_count = 0 AND NOT EXISTS (SELECT 1 FROM artifact_version_members m WHERE m.narinfo_key = objects.r2_key)) OR (objects.kind = 'nar' AND objects.narinfo_ref_count = 0));" 2>/dev/null || true)"
     deleted_keys_file="$temporary_directory/deleted-cleanup-keys"
     while IFS= read -r object_key; do
       [[ -n "$object_key" ]] || continue
       if npx wrangler r2 object delete "nix-cache-testing/$object_key" --remote --config wrangler.integration.generated.jsonc >/dev/null 2>&1; then
         printf '%s\n' "$object_key" >> "$deleted_keys_file"
       else
-        printf 'Could not delete partial integration-test object; retaining its D1 index: %s\n' "$object_key" >&2
+        printf 'Could not delete partial integration-test object; it may remain in R2: %s\n' "$object_key" >&2
       fi
     done < <(jq --raw-output '.[].results[]?.r2_key' <<<"$cleanup_keys_json" 2>/dev/null || true)
     if [[ -s "$deleted_keys_file" ]]; then

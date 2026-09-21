@@ -45,7 +45,8 @@ NAR paths, including stale 404s.
 `/nix-cache-info` is generated from Wrangler variables by the Worker. A
 deployment helper writes the same bytes to the R2 `nix-cache-info` object for a
 Custom Domain entry point. Neither path reads D1 settings or participates in a
-cache generation scheme.
+cache generation scheme. The Worker Cache key includes the public cache-info
+values so configuration changes select a new key without a D1 lookup.
 
 ### Writes and direct upload
 
