@@ -59,7 +59,7 @@ CREATE TABLE artifact_version_pending_members (
   version_id TEXT NOT NULL REFERENCES artifact_versions(version_id) ON DELETE CASCADE,
   registration_token TEXT NOT NULL,
   narinfo_key TEXT NOT NULL,
-  PRIMARY KEY (version_id, narinfo_key)
+  PRIMARY KEY (version_id, registration_token, narinfo_key)
 );
 
 CREATE INDEX idx_artifact_version_pending_members_token

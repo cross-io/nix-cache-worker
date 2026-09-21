@@ -5,6 +5,7 @@ import { hashStream } from "../domain/sha256";
 import { emitMetric } from "../observability";
 import { getObject, upsertObject } from "./db";
 import { createPresignedPut, directUploadTtl } from "./presign";
+import { discardUnindexedObject } from "./r2";
 
 export type DirectUploadInput = { key: string; size: number; sha256: string };
 
@@ -26,7 +27,7 @@ export function validateDirectUploadInput(body: unknown): DirectUploadInput {
   return { key: input.key, size: input.size, sha256: input.sha256 };
 }
 
-async function inspectDirectUploadTarget(env: Bindings, input: DirectUploadInput): Promise<{ indexed: Awaited<ReturnType<typeof getObject>>; alreadyExists: boolean }> {
+async function inspectDirectUploadTarget(env: Bindings, input: DirectUploadInput): Promise<{ indexed: Awaited<ReturnType<typeof getObject>>; alreadyExists: boolean; needsCompletion: boolean }> {
   const indexed = await getObject(env, input.key);
   if (indexed && indexed.kind !== "nar") throw new AppError("immutable_conflict", "An object with this key already exists with a different kind", 409);
   if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
@@ -35,18 +36,26 @@ async function inspectDirectUploadTarget(env: Bindings, input: DirectUploadInput
   emitMetric("r2_get", { key: input.key, kind: "nar", operation: "head", status: existing ? 200 : 404, bytes: 0, directUpload: true });
   if (existing) {
     if (indexed?.sha256 === input.sha256 && indexed.size === input.size && indexed.state === "ready") {
-      return { indexed, alreadyExists: true };
+      return { indexed, alreadyExists: true, needsCompletion: false };
     }
+    // A completed R2 PUT can be left unindexed if the Worker dies before the
+    // completion request. Let the caller repair that object through the
+    // normal hash-and-upsert completion step instead of making the orphan
+    // permanently unrecoverable.
+    if (!indexed) return { indexed: null, alreadyExists: false, needsCompletion: true };
     throw new AppError("immutable_conflict", "An object with this key already exists with different or unindexed content", 409);
   }
   if (indexed) throw new AppError("immutable_conflict", "The object index exists without a writable final object", 409);
-  return { indexed: null, alreadyExists: false };
+  return { indexed: null, alreadyExists: false, needsCompletion: false };
 }
 
 export async function issueDirectUpload(env: Bindings, input: DirectUploadInput): Promise<Record<string, unknown>> {
   const target = await inspectDirectUploadTarget(env, input);
   if (target.alreadyExists) {
     return { key: input.key, size: input.size, sha256: input.sha256, etag: target.indexed?.etag, alreadyExists: true };
+  }
+  if (target.needsCompletion) {
+    return { key: input.key, size: input.size, sha256: input.sha256, alreadyExists: false, needsCompletion: true };
   }
   const presigned = await createPresignedPut(env, input.key, directUploadTtl(env));
   return {
@@ -84,7 +93,10 @@ export async function completeDirectUpload(env: Bindings, input: DirectUploadInp
     sha256: digest.sha256,
     size: digest.size,
     state: "ready",
-  })) throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  })) {
+    await discardUnindexedObject(env, input.key, "nar", object.httpEtag);
+    throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  }
   if (!(indexed?.state === "ready" && indexed.sha256 === digest.sha256)) {
     emitMetric("upload_bytes", { key: input.key, kind: "nar", status: 201, bytes: digest.size, directUpload: true });
   }

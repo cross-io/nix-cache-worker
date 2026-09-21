@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { AppEnv } from "../env";
+import type { AppEnv, Bindings } from "../env";
 import { AppError } from "../domain/errors";
 import { emitAudit } from "../observability";
 import { getVersion, now, parseTags, type VersionRow } from "../storage/db";
@@ -126,10 +126,14 @@ versionRoutes.put("/api/packages/:packageName/versions/:versionName", requireRol
 
     await c.env.DB.prepare(
     `DELETE FROM artifact_version_pending_members
-     WHERE version_id = ? AND EXISTS (
+     WHERE version_id = ? AND registration_token != ? AND EXISTS (
        SELECT 1 FROM artifact_versions WHERE version_id = ? AND state = 'registering' AND registration_token = ?
      )`,
-  ).bind(versionId, versionId, registrationToken).run();
+  ).bind(versionId, registrationToken, versionId, registrationToken).run();
+    await c.env.DB.prepare(
+      `DELETE FROM artifact_version_pending_members
+       WHERE version_id = ? AND registration_token = ?`,
+    ).bind(versionId, registrationToken).run();
 
   // Pending members carry an operation token. A concurrent registration can
   // supersede this request, but cannot interleave with its final membership
@@ -165,7 +169,9 @@ versionRoutes.put("/api/packages/:packageName/versions/:versionName", requireRol
     throw new AppError("missing_narinfo", "One or more narinfo dependencies changed while registering the version", 424);
   }
 
-  const finalized = await c.env.DB.batch([
+  let finalized: Awaited<ReturnType<Bindings["DB"]["batch"]>>;
+  try {
+    finalized = await c.env.DB.batch([
     c.env.DB.prepare(
       `UPDATE objects SET version_member_count = MAX(0, version_member_count - (
          SELECT COUNT(*) FROM artifact_version_members m WHERE m.version_id = ? AND m.narinfo_key = objects.r2_key
@@ -189,17 +195,25 @@ versionRoutes.put("/api/packages/:packageName/versions/:versionName", requireRol
     ).bind(versionId, versionId, registrationToken),
     c.env.DB.prepare(
       `UPDATE artifact_versions
-       SET state = CASE WHEN changes() = ? THEN 'active' ELSE 'invalid_registration' END,
-           registration_token = NULL, updated_at = ?
+       SET state = CASE WHEN changes() = ? THEN 'active' ELSE state END,
+           registration_token = CASE WHEN changes() = ? THEN NULL ELSE registration_token END,
+           updated_at = CASE WHEN changes() = ? THEN ? ELSE NULL END
        WHERE version_id = ? AND state = 'registering' AND registration_token = ?`,
-    ).bind(members.length, timestamp, versionId, registrationToken),
+    ).bind(members.length, members.length, members.length, timestamp, versionId, registrationToken),
     c.env.DB.prepare(
       `UPDATE objects SET version_member_count = version_member_count + 1
        WHERE kind = 'narinfo' AND r2_key IN (SELECT narinfo_key FROM artifact_version_members WHERE version_id = ?)
          AND EXISTS (SELECT 1 FROM artifact_versions WHERE version_id = ? AND state = 'active' AND registration_token IS NULL AND updated_at = ?)`,
     ).bind(versionId, versionId, timestamp),
     c.env.DB.prepare("DELETE FROM artifact_version_pending_members WHERE version_id = ? AND registration_token = ?").bind(versionId, registrationToken),
-  ]);
+    ]);
+  } catch {
+    // The final state update deliberately violates the existing updated_at
+    // NOT NULL constraint when the preceding membership INSERT did not add
+    // the complete member set. D1 batches are transactional, so this rolls
+    // back the replacement and preserves the previous live membership.
+    throw new AppError("version_registration_failed", "The version dependencies changed before registration completed", 409);
+  }
   if ((finalized[3]?.meta.changes ?? 0) !== 1) {
     throw new AppError("version_registration_failed", "The version dependencies changed before registration completed", 409);
   }

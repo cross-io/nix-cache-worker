@@ -115,8 +115,11 @@ Content-Type: application/json
 ```
 
 The response contains `key`, `size`, `sha256`, `uploadUrl`, `uploadHeaders`,
-and `alreadyExists`. If `alreadyExists` is false, PUT the exact bytes to the
-returned URL using the returned `Content-Type` and `If-None-Match: *` headers.
+and `alreadyExists`. If `alreadyExists` is false and `needsCompletion` is not
+true, PUT the exact bytes to the returned URL using the returned `Content-Type`
+and `If-None-Match: *` headers. A `needsCompletion: true` response means that a
+previous final-key PUT succeeded but was not indexed; skip PUT and call the
+completion endpoint to repair the index.
 Then verify and index it:
 
 ```http

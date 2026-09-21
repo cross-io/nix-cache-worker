@@ -219,7 +219,7 @@ complete_upload() {
 upload_nar() {
   local nar_key="$1"
   local nar_file="$2"
-  local nar_size nar_sha256 session already_exists upload_url content_type if_none_match cache_control
+  local nar_size nar_sha256 session already_exists needs_completion upload_url content_type if_none_match cache_control
   local direct_config response_file attempt status
 
   nar_size="$(wc -c < "$nar_file" | tr -d '[:space:]')"
@@ -233,6 +233,13 @@ upload_nar() {
   already_exists="$(jq --raw-output 'if .alreadyExists == true then "true" else "false" end' <<< "$session")" || die "direct upload response was not valid JSON"
   if [[ "$already_exists" == "true" ]]; then
     printf 'NAR already exists: %s\n' "$nar_key"
+    return 0
+  fi
+
+  needs_completion="$(jq --raw-output 'if .needsCompletion == true then "true" else "false" end' <<< "$session")" || die "direct upload response was not valid JSON"
+  if [[ "$needs_completion" == "true" ]]; then
+    complete_upload "$nar_key" "$nar_size" "$nar_sha256"
+    printf 'NAR completed: %s\n' "$nar_key"
     return 0
   fi
 

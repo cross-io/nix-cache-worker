@@ -74,6 +74,14 @@ async function duplicateResult(
   return { object: existing, duplicate: true, sha256: incoming.sha256 };
 }
 
+export async function discardUnindexedObject(env: Bindings, key: string, kind: ObjectKind, etag: string): Promise<void> {
+  const current = await env.CACHE_BUCKET.head(key);
+  emitMetric("r2_get", { key, kind, operation: "head", status: current ? 200 : 404, bytes: 0, cleanup: "unindexed" });
+  // A conditional PUT may have raced with deletion. Only remove the object
+  // created by this request; never delete a newer object that reused the key.
+  if (current?.httpEtag === etag) await env.CACHE_BUCKET.delete(key);
+}
+
 /**
  * Write once to the final key. The normal path is one conditional R2 PUT and
  * one D1 upsert. Only a conditional race or an idempotent replay needs a
@@ -120,6 +128,7 @@ export async function putImmutableObject(
     emitMetric("r2_put", { key, kind, status: 201, duplicate: false, bytes: incoming.size });
     emitMetric("upload_bytes", { key, kind, status: 201, bytes: incoming.size });
     if (!await upsertObject(env, { key, kind, etag: object.httpEtag, sha256: incoming.sha256, size: incoming.size })) {
+      await discardUnindexedObject(env, key, kind, object.httpEtag);
       throw new AppError("object_deleting", "The object is currently being deleted", 409);
     }
     return { object, duplicate: false, sha256: incoming.sha256 };

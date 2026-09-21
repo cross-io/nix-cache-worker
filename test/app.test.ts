@@ -43,7 +43,7 @@ beforeAll(async () => {
     CREATE TABLE artifact_versions (version_id TEXT PRIMARY KEY, package_name TEXT NOT NULL, version_name TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '{}', retention_days INTEGER, pinned INTEGER NOT NULL DEFAULT 0, registered_at TEXT NOT NULL, updated_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('registering', 'active', 'deleting', 'deleted')), registration_token TEXT, UNIQUE(package_name, version_name));
     CREATE TABLE artifact_version_members (version_id TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(version_id, narinfo_key));
     CREATE INDEX idx_artifact_version_members_narinfo ON artifact_version_members(narinfo_key);
-    CREATE TABLE artifact_version_pending_members (version_id TEXT NOT NULL, registration_token TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(version_id, narinfo_key));
+    CREATE TABLE artifact_version_pending_members (version_id TEXT NOT NULL, registration_token TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(version_id, registration_token, narinfo_key));
     CREATE TABLE gc_policies (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, conditions_json TEXT NOT NULL DEFAULT '[]', group_by_json TEXT NOT NULL DEFAULT '[]', last_n INTEGER, duration_days INTEGER, capacity_versions INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE jobs (id TEXT PRIMARY KEY, type TEXT NOT NULL, status TEXT NOT NULL, target_version_id TEXT, cursor INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL DEFAULT '{}', last_error TEXT, created_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE UNIQUE INDEX idx_jobs_active_delete_target ON jobs(target_version_id) WHERE type = 'delete_version' AND target_version_id IS NOT NULL AND status IN ('queued', 'running', 'failed');
@@ -161,6 +161,13 @@ describe("immutable writes and direct uploads", () => {
     expect((issuedBody.uploadHeaders as Record<string, string>)["Cache-Control"]).toBe("public, max-age=31536000, immutable");
     expect(await testEnv.DB.prepare("SELECT r2_key FROM objects WHERE r2_key = ?").bind("nar/direct.nar").first()).toBeNull();
     await testEnv.CACHE_BUCKET.put("nar/direct.nar", "hello", { httpMetadata: { contentType: "application/octet-stream", cacheControl: "public, max-age=31536000, immutable" } });
+    const recovery = await request("/api/uploads", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ key: "nar/direct.nar", size: 5, sha256: digest }),
+    });
+    expect(recovery.response.status).toBe(201);
+    expect(await recovery.response.json<Record<string, unknown>>()).toMatchObject({ alreadyExists: false, needsCompletion: true });
     const completed = await request("/api/uploads/complete", {
       method: "POST",
       headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
