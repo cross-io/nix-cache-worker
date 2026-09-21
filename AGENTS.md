@@ -31,7 +31,10 @@ The project is a storage target for CI-driven package publishing. CI builds pack
 
 ## Cache compatibility
 
-All cache changes must preserve direct compatibility with `nix copy --to` and `nix copy --from`.
+All cache changes must preserve direct compatibility with `nix copy --from`
+reads. Publishing stays compatible through `bin/nix-cache-upload` and
+authenticated narinfo PUTs; ordinary NAR PUT is intentionally rejected (see
+RFC-0022).
 
 Maintain support for:
 
@@ -40,10 +43,13 @@ Maintain support for:
 - ETag, `If-None-Match`, and `If-Match` semantics.
 - Accurate `Content-Length` and `Content-Range` headers.
 - Standard `/nix-cache-info`, `.narinfo`, and `/nar/*` paths.
-- Streamed single R2 writes for ordinary standard PUTs; large NAR publishing
-  uses the stateless final-key direct-upload flow.
+- Authenticated `.narinfo` PUTs through the Worker; NAR payloads use the
+  staging direct-upload session flow (`POST /api/uploads`, PUT to
+  `_nix_uploads/<uploadId>`, `POST /api/uploads/<uploadId>/complete`).
+  Ordinary `PUT /nar/*` returns `405 direct_upload_required`.
 
-Do not introduce a custom upload protocol as a prerequisite for normal Nix cache operation.
+Do not introduce a custom upload protocol beyond the staging direct-upload
+API as a prerequisite for normal Nix cache operation.
 
 ## Immutability and consistency
 

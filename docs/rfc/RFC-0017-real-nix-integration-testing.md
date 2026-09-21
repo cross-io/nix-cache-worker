@@ -37,19 +37,21 @@ The test script creates random 8 MiB and 128 MiB files, adds them to the real
 Nix store, and checks the resulting payload bytes with `nix store cat` against
 the deployed HTTP cache:
 
-1. The small item is uploaded with normal `nix copy --to` and read back by Nix.
-2. The zero-compile upload client generates canonical file-cache NARs and
-   narinfos for both items, verifies that one NAR exceeds 100 MiB, completes
-   final-key direct-upload verification, publishes narinfos, and registers the test
-   version. Nix then reads the large target file back from the Worker with a
+1. The small and large items are both published by the zero-compile upload
+   client: every NAR goes through a staging direct-upload session
+   (`POST /api/uploads`, PUT to `_nix_uploads/<uploadId>`,
+   `POST /api/uploads/<uploadId>/complete` with digest verification and
+   promotion), then narinfos are published and the test version is registered.
+   Nix then reads both target files back from the Worker with a
    separate read-token netrc.
 
 After the read checks, the script registers both narinfos as one temporary
 version and requests its confirmed admin deletion. It polls the deletion job to
 completion so successful runs do not retain their random final large NAR in R2.
 The test template reduces the direct-upload URL lifetime to 15 minutes. Each
-run resets the isolated D1 and R2 resources before deployment; the final-key
-flow has no staging object or session cleanup lifecycle.
+run resets the isolated D1 and R2 resources before deployment; staging
+objects and upload sessions are retained until expiry and are removed by
+the bounded scheduled cleanup.
 
 The test uses `require-sigs = false` only because the fixture's generated
 narinfos are unsigned. It does not relax the Worker authorization boundary:
@@ -88,9 +90,9 @@ the application's existing migration chain.
 
 - The workflow refuses to run without each required GitHub Secret.
 - It fails clearly if the R2 bucket or D1 database is missing.
-- A sub-50 MiB NAR is uploaded by `nix copy --to` and read by Nix from the
-  deployed cache.
-- A Nix-generated NAR larger than 100 MiB is uploaded by the presigned direct
+- Both the sub-50 MiB and the over-100 MiB NARs are uploaded by the staging
+  direct-upload client and read by Nix from the deployed cache.
+- A Nix-generated NAR larger than 100 MiB is uploaded by the staging session
   flow, followed by its standard narinfo PUT, and read by Nix from the deployed
   cache.
 - Both Nix readbacks follow the configured presigned R2 GET/HEAD redirect.
@@ -99,7 +101,8 @@ the application's existing migration chain.
 - The integration script confirms that its direct large-NAR GET and HEAD first
   receive a signed R2 redirect without emitting the bearer URL.
 - Successful tests complete their authorized deletion job and remove final test
-  NARs; no staging cleanup is required.
+  NARs; expired staging objects and terminal sessions are removed by the
+  scheduled cleanup.
 - Failed or cancelled tests make a best-effort removal of their pre-recorded,
   unreferenced final object keys.
 - HUP, INT, and TERM are converted to nonzero exits before the EXIT trap runs,
@@ -112,3 +115,6 @@ the application's existing migration chain.
 
 Implemented by `.github/workflows/nix-integration.yml`,
 `wrangler.integration.jsonc`, and `scripts/integration/nix-cache-e2e.sh`.
+The NAR upload path follows the staging direct-upload sessions from RFC-0022;
+ordinary Worker NAR PUTs are rejected and stock `nix copy --to` against the
+Worker is not used for publishing.
