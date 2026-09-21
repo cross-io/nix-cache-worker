@@ -139,8 +139,9 @@ file to that URL before calling completion. A wrong digest or size is retained
 because a stateless completion request cannot prove it owns the final bytes;
 remove the resulting unindexed immutable key manually if necessary. There are
 no staging sessions to expire or clean up. Version deletion leaves a D1
-tombstone and waits for the configured direct-upload URL TTL before removing
-the R2 object, preventing an already-issued presigned PUT from resurrecting it.
+tombstone and waits for the maximum seven-day direct-upload URL lifetime before
+removing the R2 object, preventing an already-issued presigned PUT from
+resurrecting it.
 
 ## Operations and recovery
 

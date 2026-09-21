@@ -3,7 +3,7 @@ import { AppError } from "../domain/errors";
 
 const AWS_REGION = "auto";
 const AWS_SERVICE = "s3";
-const MAX_PRESIGN_SECONDS = 7 * 24 * 60 * 60;
+export const MAX_PRESIGN_SECONDS = 7 * 24 * 60 * 60;
 
 export type PresignedPut = {
   url: string;

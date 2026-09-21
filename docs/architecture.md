@@ -84,11 +84,11 @@ audit metadata. `objects` stores both `narinfo_ref_count` and
 
 Membership changes and counter changes use the same D1 batch. A NAR can enter
 the deletion state only while it is ready and `narinfo_ref_count = 0`. Deletion
-first records a D1 tombstone and waits for the configured direct-upload URL TTL
-before deleting R2, so a presigned PUT issued before deletion cannot resurrect
-the key. R2 deletion and final tombstone update are independent retryable job
-steps. If a job is interrupted after a D1 state transition or an R2 delete,
-retrying is safe.
+first records a D1 deletion fence and waits for the maximum permitted
+presigned-upload lifetime (seven days) before deleting R2, so a presigned PUT
+issued before deletion cannot resurrect the key. R2 deletion and final
+tombstone update are independent retryable job steps. If a job is interrupted
+after a D1 state transition or an R2 delete, retrying is safe.
 
 Versions are identified by `(package_name, version_name)`; names are opaque.
 Retention and pinning are used only by GC and never affect HTTP response TTLs.

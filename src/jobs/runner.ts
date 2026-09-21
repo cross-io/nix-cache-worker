@@ -9,7 +9,7 @@ import {
 } from "../domain/policy";
 import { emitAudit } from "../observability";
 import { now, type VersionRow } from "../storage/db";
-import { directUploadTtl } from "../storage/presign";
+import { MAX_PRESIGN_SECONDS } from "../storage/presign";
 import { createDeletionJob, findActiveDeletionJob, touchJob } from "./jobs";
 
 const MEMBER_PAGE_SIZE = 500;
@@ -267,7 +267,7 @@ async function processDeleteObjects(env: Bindings, jobId: string): Promise<boole
       lastHeartbeat = Date.now();
     }
     const deletingAt = await markObjectDeleting(env, item);
-    if (deletingAt && Date.now() >= Date.parse(deletingAt) + directUploadTtl(env) * 1000) {
+    if (deletingAt && Date.now() >= Date.parse(deletingAt) + MAX_PRESIGN_SECONDS * 1000) {
       await env.CACHE_BUCKET.delete(item.object_key);
       await env.DB.prepare(
         "UPDATE objects SET state = 'deleted', deleting_at = NULL, uploaded_at = ? WHERE r2_key = ? AND state = 'deleting'",

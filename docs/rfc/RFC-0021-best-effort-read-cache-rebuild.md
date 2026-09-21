@@ -70,7 +70,8 @@ narinfo `version_member_count` are changed together as well.
 
 Deletion may mark a NAR for R2 removal only when it is ready and its
 `narinfo_ref_count` is zero. The D1 row becomes a permanent deleted tombstone,
-and the job waits for the configured direct-upload URL TTL before deleting R2.
+and the job waits for the maximum permitted seven-day direct-upload URL
+lifetime before deleting R2.
 This prevents an already-issued `If-None-Match: *` PUT from recreating a key
 after the R2 delete. R2 deletion and final tombstone update are independent,
 bounded, retryable job steps. A stale CDN response does not affect these
