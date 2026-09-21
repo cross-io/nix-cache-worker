@@ -40,7 +40,7 @@ beforeAll(async () => {
     CREATE TABLE objects (r2_key TEXT PRIMARY KEY, kind TEXT NOT NULL, etag TEXT NOT NULL, sha256 TEXT, size INTEGER NOT NULL, uploaded_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'ready', narinfo_ref_count INTEGER NOT NULL DEFAULT 0, version_member_count INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE narinfo_refs (narinfo_key TEXT PRIMARY KEY, nar_key TEXT NOT NULL, store_path TEXT, created_at TEXT NOT NULL);
     CREATE INDEX idx_narinfo_refs_nar ON narinfo_refs(nar_key);
-    CREATE TABLE artifact_versions (version_id TEXT PRIMARY KEY, package_name TEXT NOT NULL, version_name TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '{}', retention_days INTEGER, pinned INTEGER NOT NULL DEFAULT 0, registered_at TEXT NOT NULL, updated_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', registration_token TEXT, UNIQUE(package_name, version_name));
+    CREATE TABLE artifact_versions (version_id TEXT PRIMARY KEY, package_name TEXT NOT NULL, version_name TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '{}', retention_days INTEGER, pinned INTEGER NOT NULL DEFAULT 0, registered_at TEXT NOT NULL, updated_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('registering', 'active', 'deleting', 'deleted')), registration_token TEXT, UNIQUE(package_name, version_name));
     CREATE TABLE artifact_version_members (version_id TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(version_id, narinfo_key));
     CREATE INDEX idx_artifact_version_members_narinfo ON artifact_version_members(narinfo_key);
     CREATE TABLE artifact_version_pending_members (version_id TEXT NOT NULL, registration_token TEXT NOT NULL, narinfo_key TEXT NOT NULL, PRIMARY KEY(version_id, narinfo_key));

@@ -188,9 +188,11 @@ versionRoutes.put("/api/packages/:packageName/versions/:versionName", requireRol
        WHERE p.version_id = ? AND p.registration_token = ?`,
     ).bind(versionId, versionId, registrationToken),
     c.env.DB.prepare(
-      `UPDATE artifact_versions SET state = 'active', registration_token = NULL, updated_at = ?
-       WHERE version_id = ? AND state = 'registering' AND registration_token = ? AND changes() = ?`,
-    ).bind(timestamp, versionId, registrationToken, members.length),
+      `UPDATE artifact_versions
+       SET state = CASE WHEN changes() = ? THEN 'active' ELSE 'invalid_registration' END,
+           registration_token = NULL, updated_at = ?
+       WHERE version_id = ? AND state = 'registering' AND registration_token = ?`,
+    ).bind(members.length, timestamp, versionId, registrationToken),
     c.env.DB.prepare(
       `UPDATE objects SET version_member_count = version_member_count + 1
        WHERE kind = 'narinfo' AND r2_key IN (SELECT narinfo_key FROM artifact_version_members WHERE version_id = ?)

@@ -86,8 +86,14 @@ async function protectedVersionIds(env: Bindings, jobId: string, versions: Versi
     const batch = versions.slice(offset, offset + GC_VERSION_QUERY_BATCH_SIZE);
     const placeholders = batch.map(() => "?").join(",");
     const result = await env.DB.prepare(
-      `SELECT DISTINCT version_id FROM gc_policy_matches
-       WHERE job_id = ? AND keep_count > 0 AND version_id IN (${placeholders})`,
+      `SELECT DISTINCT version_id FROM (
+         SELECT version_id, keep_count,
+           ROW_NUMBER() OVER (PARTITION BY policy_id, group_key ORDER BY registered_at DESC, version_id DESC) AS position
+         FROM gc_policy_matches
+         WHERE job_id = ? AND keep_count IS NOT NULL
+       ) ranked
+       WHERE keep_count > 0 AND position <= keep_count
+         AND version_id IN (${placeholders})`,
     ).bind(jobId, ...batch.map((row) => row.version_id)).all<{ version_id: string }>();
     for (const row of result.results) protectedIds.add(row.version_id);
   }
