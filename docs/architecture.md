@@ -39,11 +39,13 @@ They are stored with:
 Cache-Control: public, max-age=31536000, immutable
 ```
 
-The same metadata is used by direct final-key uploads. The R2 Custom Domain
+The same metadata is used by direct final-key NAR uploads. The R2 Custom Domain
 should use a Cache Rule covering `/nix-cache-info`, `/*.narinfo`, and `/nar/*`
-with a long edge TTL and cached 404s. Deletion does not bump a generation or
-invalidate edge caches. A CDN, presigned URL, or client may therefore return a
-stale object after deletion; this is intentional best-effort behavior.
+with a long edge TTL and cached 404s. `/nix-cache-info` uses a short five-minute
+client cache lifetime because deployment variables can change; the edge rule
+may still keep it warm. Deletion does not bump a generation or invalidate edge
+caches. A CDN, presigned URL, or client may therefore return a stale object
+after deletion; this is intentional best-effort behavior.
 
 `/nix-cache-info` is generated from Wrangler variables by the Worker. For an
 R2 Custom Domain, deployment writes the same bytes to the `nix-cache-info` R2
@@ -71,6 +73,7 @@ There are no staging keys, upload sessions, staging cleanup jobs, or
 `_nix_uploads/` objects in the new deployment. A wrong digest or size leaves
 the final object untouched because completion cannot prove ownership of bytes
 written through a valid presigned URL; operators can remove that unindexed key.
+Direct uploads are limited to R2's 5 GiB single-PUT maximum.
 
 ## D1 lifecycle model
 
@@ -80,9 +83,12 @@ audit metadata. `objects` stores both `narinfo_ref_count` and
 `version_member_count`, so GC does not need a per-object `COUNT(*)` scan.
 
 Membership changes and counter changes use the same D1 batch. A NAR can enter
-the deletion state only while it is ready and `narinfo_ref_count = 0`. R2
-deletion and final D1 cleanup are independent retryable job steps. If a job is
-interrupted after a D1 state transition or an R2 delete, retrying is safe.
+the deletion state only while it is ready and `narinfo_ref_count = 0`. Deletion
+first records a D1 tombstone and waits for the configured direct-upload URL TTL
+before deleting R2, so a presigned PUT issued before deletion cannot resurrect
+the key. R2 deletion and final tombstone update are independent retryable job
+steps. If a job is interrupted after a D1 state transition or an R2 delete,
+retrying is safe.
 
 Versions are identified by `(package_name, version_name)`; names are opaque.
 Retention and pinning are used only by GC and never affect HTTP response TTLs.

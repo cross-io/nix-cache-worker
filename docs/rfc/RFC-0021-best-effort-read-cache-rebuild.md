@@ -39,8 +39,10 @@ represented by a redirect in the target Nix client.
 When `READ_TOKEN` is empty, anonymous Worker redirects and an R2 Custom Domain
 are both valid entry points. A Custom Domain is forbidden when read
 authentication is enabled because it bypasses the Worker. The Custom Domain
-deployment uses a long immutable Cache Rule for `/nix-cache-info`, narinfo, and
-NAR paths, including stale 404s.
+deployment uses a long edge Cache Rule for `/nix-cache-info`, narinfo, and NAR
+paths, including stale 404s. The Worker and R2 cache-info object use
+`public, max-age=300` because deployment values can change; the edge rule may
+still retain the response longer.
 
 `/nix-cache-info` is generated from Wrangler variables by the Worker. A
 deployment helper writes the same bytes to the R2 `nix-cache-info` object for a
@@ -67,7 +69,10 @@ D1 batch as narinfo publication or reference removal. Version membership and
 narinfo `version_member_count` are changed together as well.
 
 Deletion may mark a NAR for R2 removal only when it is ready and its
-`narinfo_ref_count` is zero. R2 deletion and final D1 cleanup are independent,
+`narinfo_ref_count` is zero. The D1 row becomes a permanent deleted tombstone,
+and the job waits for the configured direct-upload URL TTL before deleting R2.
+This prevents an already-issued `If-None-Match: *` PUT from recreating a key
+after the R2 delete. R2 deletion and final tombstone update are independent,
 bounded, retryable job steps. A stale CDN response does not affect these
 database invariants.
 
@@ -105,7 +110,7 @@ API endpoint is migrated.
 
 - Authenticated and anonymous Worker reads redirect without D1 or R2 `HEAD`.
 - Missing objects reach R2 and return `404`; redirects are not cached by Worker.
-- Static cache metadata is immutable and no longer depends on retention.
+- Static cache metadata uses a five-minute client TTL and no longer depends on retention.
 - Final-key direct upload and completion are idempotent and digest checked.
 - Shared NAR reference counters protect the last live reference under GC.
 - A fresh database is created by the single migration.

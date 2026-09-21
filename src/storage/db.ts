@@ -8,6 +8,7 @@ export type ObjectRow = {
   sha256: string | null;
   size: number;
   uploaded_at: string;
+  deleting_at: string | null;
   state: string;
   narinfo_ref_count: number;
   version_member_count: number;
@@ -54,7 +55,7 @@ export async function upsertObject(env: Bindings, object: {
      VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)
      ON CONFLICT(r2_key) DO UPDATE SET etag = excluded.etag, sha256 = excluded.sha256,
        size = excluded.size, state = excluded.state
-     WHERE objects.state NOT IN ('deleting', 'orphaned')`,
+     WHERE objects.state NOT IN ('deleting', 'orphaned', 'deleted')`,
   ).bind(object.key, object.kind, object.etag, object.sha256, object.size, timestamp, object.state ?? "ready").run();
   return result.meta.changes === 1;
 }

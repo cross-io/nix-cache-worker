@@ -60,7 +60,7 @@ async function duplicateResult(
   existing: R2Object,
   indexed: Awaited<ReturnType<typeof getObject>>,
 ): Promise<UploadResult> {
-  if (indexed?.state === "deleting" || indexed?.state === "orphaned") throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  if (indexed?.state === "deleting" || indexed?.state === "orphaned" || indexed?.state === "deleted") throw new AppError("object_deleting", "The object is currently being deleted", 409);
   const existingSha256 = await digestExisting(env, key, kind, existing, indexed);
   if (incoming.sha256 !== existingSha256 || incoming.size !== existing.size) {
     throw new AppError("immutable_conflict", "An object with this key already exists with different content", 409);
@@ -90,7 +90,18 @@ export async function discardUnindexedObject(env: Bindings, key: string, kind: O
     // direct-upload object that appeared after the deletion claim.
     if (current?.httpEtag === etag) await env.CACHE_BUCKET.delete(key);
   } finally {
-    await env.DB.prepare("DELETE FROM objects WHERE r2_key = ? AND state = 'orphaned'").bind(key).run();
+    await env.DB.prepare(
+      "UPDATE objects SET state = 'deleted', deleting_at = NULL, uploaded_at = ? WHERE r2_key = ? AND state = 'orphaned'",
+    ).bind(new Date().toISOString(), key).run();
+  }
+}
+
+async function discardCreatedObject(env: Bindings, key: string, kind: ObjectKind, etag: string): Promise<void> {
+  const current = await env.CACHE_BUCKET.head(key);
+  emitMetric("r2_get", { key, kind, operation: "head", status: current ? 200 : 404, bytes: 0, cleanup: "conflicting_put" });
+  if (current?.httpEtag === etag) {
+    await env.CACHE_BUCKET.delete(key);
+    emitMetric("r2_put", { key, kind, status: 204, duplicate: false, bytes: 0, cleanup: "conflicting_put" });
   }
 }
 
@@ -141,7 +152,7 @@ export async function putImmutableObject(
     if (indexed?.state === "ready" && (
       !indexed.sha256 || indexed.size !== incoming.size || indexed.sha256 !== incoming.sha256
     )) {
-      await discardUnindexedObject(env, key, kind, object.httpEtag);
+      await discardCreatedObject(env, key, kind, object.httpEtag);
       throw new AppError("immutable_conflict", "The D1 index already contains different immutable content", 409);
     }
     emitMetric("r2_put", { key, kind, status: 201, duplicate: false, bytes: incoming.size });

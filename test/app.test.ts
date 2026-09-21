@@ -37,7 +37,7 @@ beforeAll(async () => {
     DROP TABLE IF EXISTS gc_policies;
     DROP TABLE IF EXISTS audit_log;
     CREATE TABLE artifact_packages (package_name TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-    CREATE TABLE objects (r2_key TEXT PRIMARY KEY, kind TEXT NOT NULL, etag TEXT NOT NULL, sha256 TEXT, size INTEGER NOT NULL, uploaded_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'ready', narinfo_ref_count INTEGER NOT NULL DEFAULT 0, version_member_count INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE objects (r2_key TEXT PRIMARY KEY, kind TEXT NOT NULL, etag TEXT NOT NULL, sha256 TEXT, size INTEGER NOT NULL, uploaded_at TEXT NOT NULL, deleting_at TEXT, state TEXT NOT NULL DEFAULT 'ready', narinfo_ref_count INTEGER NOT NULL DEFAULT 0, version_member_count INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE narinfo_refs (narinfo_key TEXT PRIMARY KEY, nar_key TEXT NOT NULL, store_path TEXT, created_at TEXT NOT NULL);
     CREATE INDEX idx_narinfo_refs_nar ON narinfo_refs(nar_key);
     CREATE TABLE artifact_versions (version_id TEXT PRIMARY KEY, package_name TEXT NOT NULL, version_name TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '{}', retention_days INTEGER, pinned INTEGER NOT NULL DEFAULT 0, registered_at TEXT NOT NULL, updated_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('registering', 'active', 'deleting', 'deleted')), registration_token TEXT, UNIQUE(package_name, version_name));
@@ -118,7 +118,7 @@ describe("cache read routing", () => {
     const response = await request("/nix-cache-info", { headers: bearer("read-secret") });
     expect(response.response.status).toBe(200);
     expect(await response.response.text()).toContain("StoreDir: /nix/store");
-    expect(response.response.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
+    expect(response.response.headers.get("Cache-Control")).toBe("public, max-age=300");
   });
 });
 
@@ -166,6 +166,15 @@ describe("immutable writes and direct uploads", () => {
     }
   });
 
+  it("removes a newly created R2 object when its immutable D1 index conflicts", async () => {
+    const first = await request("/nar/index-conflict.nar", { method: "PUT", headers: bearer("write-secret"), body: "hello" });
+    expect(first.response.status).toBe(201);
+    await testEnv.CACHE_BUCKET.delete("nar/index-conflict.nar");
+    const conflict = await request("/nar/index-conflict.nar", { method: "PUT", headers: bearer("write-secret"), body: "different" });
+    expect(conflict.response.status).toBe(409);
+    expect(await testEnv.CACHE_BUCKET.head("nar/index-conflict.nar")).toBeNull();
+  });
+
   it("issues a final-key presigned upload and verifies completion", async () => {
     const digest = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
     const issued = await request("/api/uploads", {
@@ -200,6 +209,29 @@ describe("immutable writes and direct uploads", () => {
       body: JSON.stringify({ key: "nar/direct.nar", size: 5, sha256: digest }),
     });
     expect(replay.response.status).toBe(200);
+  });
+
+  it("rejects direct uploads above R2's single-PUT limit before issuing a URL", async () => {
+    const response = await request("/api/uploads", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ key: "nar/too-large.nar", size: 5 * 1024 * 1024 * 1024 + 1, sha256: "0".repeat(64) }),
+    });
+    expect(response.response.status).toBe(422);
+  });
+
+  it("cleans a late direct upload that reaches a deleted tombstone", async () => {
+    await testEnv.DB.prepare(
+      "INSERT INTO objects (r2_key, kind, etag, sha256, size, uploaded_at, state) VALUES (?, 'nar', ?, ?, ?, ?, 'deleted')",
+    ).bind("nar/deleted.nar", '"deleted-etag"', "0".repeat(64), 4, new Date().toISOString()).run();
+    await testEnv.CACHE_BUCKET.put("nar/deleted.nar", "late");
+    const response = await request("/api/uploads/complete", {
+      method: "POST",
+      headers: { ...bearer("write-secret"), "Content-Type": "application/json" },
+      body: JSON.stringify({ key: "nar/deleted.nar", size: 4, sha256: "0".repeat(64) }),
+    });
+    expect(response.response.status).toBe(409);
+    expect(await testEnv.CACHE_BUCKET.head("nar/deleted.nar")).toBeNull();
   });
 
   it("retains a mismatched final object because completion cannot prove ownership", async () => {

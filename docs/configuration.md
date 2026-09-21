@@ -53,8 +53,9 @@ non-empty, `GET` and `HEAD` cache paths require read, write, or admin
 authentication and always redirect through the Worker. Do not expose a public
 R2 Custom Domain in that mode.
 
-Read redirects use `Cache-Control: no-store`; the final R2 object uses the
-immutable one-year metadata. Deletion is best effort: CDN, browser, and
+Read redirects use `Cache-Control: no-store`; final NAR and narinfo objects use
+immutable one-year metadata, while `/nix-cache-info` uses a five-minute client
+cache lifetime. Deletion is best effort: CDN, browser, and
 presigned URL caches may continue to return old bytes or 404s.
 
 The Worker also accepts Nix netrc-generated Basic credentials where the
@@ -85,7 +86,7 @@ npx wrangler r2 object put "$R2_BUCKET_NAME/nix-cache-info" \
   --remote \
   --file /tmp/nix-cache-info \
   --content-type 'text/plain; charset=utf-8' \
-  --cache-control 'public, max-age=31536000, immutable'
+  --cache-control 'public, max-age=300'
 ```
 
 ## Standard publishing

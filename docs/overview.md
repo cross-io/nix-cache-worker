@@ -85,11 +85,13 @@ session cleanup jobs.
 | Path | Header |
 | --- | --- |
 | `/nar/*` and `*.narinfo` | `public, max-age=31536000, immutable` |
-| `/nix-cache-info` | `public, max-age=31536000, immutable` |
+| `/nix-cache-info` | `public, max-age=300` |
 
-Retention and deletion state never change HTTP TTL. R2 Custom Domain deployments
-should apply the same long edge TTL to `/nix-cache-info`, `/*.narinfo`, and
-`/nar/*`, including cached 404s. Stale content after deletion is accepted.
+Retention and deletion state never change object HTTP TTL. R2 Custom Domain
+deployments should apply a long edge TTL to `/nix-cache-info`, `/*.narinfo`, and
+`/nar/*`, including cached 404s. The cache-info object keeps its five-minute
+client cache header so deployment configuration changes are not immutable at
+the public URL. Stale content after deletion is accepted.
 
 ### `nix-cache-info`
 

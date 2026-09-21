@@ -27,7 +27,7 @@ export function kindForKey(key: string): ObjectKind {
 export function cacheControlFor(kind: ObjectKind, maxAgeSeconds?: number): string {
   if (kind === "nar") return `public, max-age=${maxAgeSeconds ?? 31536000}${maxAgeSeconds === undefined || maxAgeSeconds > 0 ? ", immutable" : ""}`;
   if (kind === "narinfo") return `public, max-age=${maxAgeSeconds ?? 31536000}, immutable`;
-  return `public, max-age=${maxAgeSeconds ?? 31536000}, immutable`;
+  return `public, max-age=${maxAgeSeconds ?? 300}`;
 }
 
 export function contentTypeFor(kind: ObjectKind): string {

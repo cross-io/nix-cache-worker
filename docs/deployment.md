@@ -100,7 +100,8 @@ Priority: <DEFAULT_PRIORITY>
 
 Write those exact bytes to the R2 key `nix-cache-info` using the deployment
 command in [`configuration.md`](configuration.md), with
-`public, max-age=31536000, immutable` metadata.
+`public, max-age=300` metadata. The cache rule may keep this object at the edge
+longer, but clients must revalidate deployment values after five minutes.
 
 ## 7. Smoke test
 
@@ -137,7 +138,9 @@ The first response supplies the presigned PUT URL and required headers. PUT the
 file to that URL before calling completion. A wrong digest or size is retained
 because a stateless completion request cannot prove it owns the final bytes;
 remove the resulting unindexed immutable key manually if necessary. There are
-no staging sessions to expire or clean up.
+no staging sessions to expire or clean up. Version deletion leaves a D1
+tombstone and waits for the configured direct-upload URL TTL before removing
+the R2 object, preventing an already-issued presigned PUT from resurrecting it.
 
 ## Operations and recovery
 

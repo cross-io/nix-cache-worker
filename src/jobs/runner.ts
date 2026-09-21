@@ -9,6 +9,7 @@ import {
 } from "../domain/policy";
 import { emitAudit } from "../observability";
 import { now, type VersionRow } from "../storage/db";
+import { directUploadTtl } from "../storage/presign";
 import { createDeletionJob, findActiveDeletionJob, touchJob } from "./jobs";
 
 const MEMBER_PAGE_SIZE = 500;
@@ -236,17 +237,20 @@ async function detachVersionMembers(env: Bindings, jobId: string, versionId: str
   ]);
 }
 
-async function markObjectDeleting(env: Bindings, item: JobObjectRow): Promise<boolean> {
+async function markObjectDeleting(env: Bindings, item: JobObjectRow): Promise<string | null> {
   const guard = item.object_kind === "narinfo"
     ? `kind = 'narinfo' AND version_member_count = 0
        AND NOT EXISTS (SELECT 1 FROM artifact_version_members m WHERE m.narinfo_key = objects.r2_key)
        AND NOT EXISTS (SELECT 1 FROM narinfo_refs r WHERE r.narinfo_key = objects.r2_key)`
     : "kind = 'nar' AND narinfo_ref_count = 0";
   const result = await env.DB.prepare(
-    `UPDATE objects SET state = 'deleting'
+    `UPDATE objects SET state = 'deleting', deleting_at = COALESCE(deleting_at, ?)
      WHERE r2_key = ? AND state IN ('ready', 'deleting') AND ${guard}`,
-  ).bind(item.object_key).run();
-  return result.meta.changes === 1;
+  ).bind(now(), item.object_key).run();
+  if (result.meta.changes !== 1) return null;
+  const row = await env.DB.prepare("SELECT deleting_at FROM objects WHERE r2_key = ? AND state = 'deleting'")
+    .bind(item.object_key).first<{ deleting_at: string | null }>();
+  return row?.deleting_at ?? null;
 }
 
 async function processDeleteObjects(env: Bindings, jobId: string): Promise<boolean> {
@@ -255,24 +259,31 @@ async function processDeleteObjects(env: Bindings, jobId: string): Promise<boole
   ).bind(jobId, OBJECT_PAGE_SIZE).all<JobObjectRow>();
   if (!rows.results.length) return true;
   let lastHeartbeat = Date.now();
+  let deferred = false;
   for (let index = 0; index < rows.results.length; index += 1) {
     const item = rows.results[index];
     if (Date.now() - lastHeartbeat >= 60_000) {
       await touchJob(env, jobId);
       lastHeartbeat = Date.now();
     }
-    const marked = await markObjectDeleting(env, item);
-    if (marked) {
+    const deletingAt = await markObjectDeleting(env, item);
+    if (deletingAt && Date.now() >= Date.parse(deletingAt) + directUploadTtl(env) * 1000) {
       await env.CACHE_BUCKET.delete(item.object_key);
       await env.DB.prepare(
-        "DELETE FROM objects WHERE r2_key = ? AND state = 'deleting'",
-      ).bind(item.object_key).run();
+        "UPDATE objects SET state = 'deleted', deleting_at = NULL, uploaded_at = ? WHERE r2_key = ? AND state = 'deleting'",
+      ).bind(now(), item.object_key).run();
+    } else if (deletingAt) {
+      // Keep the job item so the next maintenance run can retry after every
+      // presigned PUT that existed before the tombstone had a chance to expire.
+      await touchJob(env, jobId);
+      deferred = true;
+      continue;
     }
     await env.DB.prepare("DELETE FROM job_object_items WHERE job_id = ? AND object_key = ? AND object_kind = ?")
       .bind(jobId, item.object_key, item.object_kind).run();
   }
   await touchJob(env, jobId);
-  return rows.results.length < OBJECT_PAGE_SIZE;
+  return !deferred && rows.results.length < OBJECT_PAGE_SIZE;
 }
 
 async function finishDeleteVersion(env: Bindings, jobId: string, version: VersionRow): Promise<void> {

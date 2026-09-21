@@ -9,6 +9,10 @@ import { discardUnindexedObject } from "./r2";
 
 export type DirectUploadInput = { key: string; size: number; sha256: string };
 
+// R2 single-object PUTs are limited to 5 GiB. The client deliberately uses
+// this stateless single-PUT protocol instead of multipart uploads.
+export const MAX_DIRECT_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
+
 function assertSupportedNarKey(key: string): void {
   try {
     if (kindForKey(key) !== "nar" || key.includes("\0") || key.includes("..")) throw new Error("invalid");
@@ -23,6 +27,7 @@ export function validateDirectUploadInput(body: unknown): DirectUploadInput {
   if (typeof input.key !== "string" || input.key.length === 0 || input.key.length > 1024) throw new AppError("invalid_upload_key", "The direct-upload key is invalid", 422);
   assertSupportedNarKey(input.key);
   if (typeof input.size !== "number" || !Number.isSafeInteger(input.size) || input.size < 0) throw new AppError("invalid_upload_size", "The direct-upload size must be a non-negative safe integer", 422);
+  if (input.size > MAX_DIRECT_UPLOAD_BYTES) throw new AppError("invalid_upload_size", "The direct-upload size must not exceed the 5 GiB R2 single-PUT limit", 422);
   if (typeof input.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(input.sha256)) throw new AppError("invalid_upload_sha256", "The direct-upload SHA-256 must be 64 lowercase hexadecimal characters", 422);
   return { key: input.key, size: input.size, sha256: input.sha256 };
 }
@@ -30,7 +35,7 @@ export function validateDirectUploadInput(body: unknown): DirectUploadInput {
 async function inspectDirectUploadTarget(env: Bindings, input: DirectUploadInput): Promise<{ indexed: Awaited<ReturnType<typeof getObject>>; alreadyExists: boolean; needsCompletion: boolean }> {
   const indexed = await getObject(env, input.key);
   if (indexed && indexed.kind !== "nar") throw new AppError("immutable_conflict", "An object with this key already exists with a different kind", 409);
-  if (indexed?.state === "deleting" || indexed?.state === "orphaned") throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  if (indexed?.state === "deleting" || indexed?.state === "orphaned" || indexed?.state === "deleted") throw new AppError("object_deleting", "The object is currently being deleted", 409);
 
   const existing = await env.CACHE_BUCKET.head(input.key);
   emitMetric("r2_get", { key: input.key, kind: "nar", operation: "head", status: existing ? 200 : 404, bytes: 0, directUpload: true });
@@ -75,6 +80,14 @@ export async function completeDirectUpload(env: Bindings, input: DirectUploadInp
   if (!object) throw new AppError("upload_not_found", "The final R2 object was not found", 424);
   const indexed = await getObject(env, input.key);
   if (indexed?.state === "deleting" || indexed?.state === "orphaned") throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  if (indexed?.state === "deleted") {
+    // A presigned PUT may have been issued before the tombstone was created.
+    // It cannot be validly completed or served, so remove any late object it
+    // left behind before rejecting the completion request.
+    await env.CACHE_BUCKET.delete(input.key);
+    emitMetric("r2_put", { key: input.key, kind: "nar", status: 204, duplicate: false, bytes: 0, directUpload: true, tombstoneCleanup: true });
+    throw new AppError("object_deleting", "The object key has been permanently deleted", 409);
+  }
   if (indexed && indexed.kind !== "nar") throw new AppError("immutable_conflict", "An object with this key already exists with a different kind", 409);
   if (indexed?.state === "ready" && (indexed.sha256 !== input.sha256 || indexed.size !== input.size)) {
     throw new AppError("immutable_conflict", "An object with this key already exists with different content", 409);

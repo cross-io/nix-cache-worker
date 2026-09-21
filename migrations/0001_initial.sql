@@ -13,6 +13,7 @@ CREATE TABLE objects (
   sha256 TEXT,
   size INTEGER NOT NULL CHECK (size >= 0),
   uploaded_at TEXT NOT NULL,
+  deleting_at TEXT,
   state TEXT NOT NULL DEFAULT 'ready' CHECK (state IN ('pending', 'ready', 'orphaned', 'deleting', 'deleted')),
   narinfo_ref_count INTEGER NOT NULL DEFAULT 0 CHECK (narinfo_ref_count >= 0),
   version_member_count INTEGER NOT NULL DEFAULT 0 CHECK (version_member_count >= 0)
