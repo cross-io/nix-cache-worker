@@ -145,6 +145,25 @@ describe("immutable writes and direct uploads", () => {
     const ranged = await request("/nar/immutable.nar", { method: "HEAD", headers: { ...bearer("read-secret"), Range: "bytes=1-3" } });
     expect(ranged.response.status).toBe(206);
     expect(ranged.response.headers.get("Content-Range")).toBe("bytes 1-3/5");
+    const presignConfig = {
+      account: testEnv.R2_ACCOUNT_ID,
+      bucket: testEnv.R2_BUCKET_NAME,
+      accessKey: testEnv.R2_S3_ACCESS_KEY_ID,
+      secret: testEnv.R2_S3_SECRET_ACCESS_KEY,
+    };
+    testEnv.R2_ACCOUNT_ID = undefined;
+    testEnv.R2_BUCKET_NAME = undefined;
+    testEnv.R2_S3_ACCESS_KEY_ID = undefined;
+    testEnv.R2_S3_SECRET_ACCESS_KEY = undefined;
+    try {
+      const fallbackWithoutPresigning = await request("/nar/immutable.nar", { method: "HEAD", headers: { ...bearer("read-secret"), Range: "bytes=1-3" } });
+      expect(fallbackWithoutPresigning.response.status).toBe(206);
+    } finally {
+      testEnv.R2_ACCOUNT_ID = presignConfig.account;
+      testEnv.R2_BUCKET_NAME = presignConfig.bucket;
+      testEnv.R2_S3_ACCESS_KEY_ID = presignConfig.accessKey;
+      testEnv.R2_S3_SECRET_ACCESS_KEY = presignConfig.secret;
+    }
   });
 
   it("issues a final-key presigned upload and verifies completion", async () => {

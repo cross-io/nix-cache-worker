@@ -95,6 +95,7 @@ export async function putImmutableObject(
   options: { allowPending?: boolean } = {},
 ): Promise<UploadResult> {
   const indexed = await getObject(env, key);
+  if (indexed && indexed.kind !== kind) throw new AppError("immutable_conflict", "An object with this key already exists with a different kind", 409);
   if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
   if (indexed?.state === "pending" && !options.allowPending) {
     throw new AppError("object_uploading", "The object is currently being uploaded", 409);
@@ -125,6 +126,12 @@ export async function putImmutableObject(
   });
   const incoming = await hashPromise;
   if (object) {
+    if (indexed?.state === "ready" && (
+      !indexed.sha256 || indexed.size !== incoming.size || indexed.sha256 !== incoming.sha256
+    )) {
+      await discardUnindexedObject(env, key, kind, object.httpEtag);
+      throw new AppError("immutable_conflict", "The D1 index already contains different immutable content", 409);
+    }
     emitMetric("r2_put", { key, kind, status: 201, duplicate: false, bytes: incoming.size });
     emitMetric("upload_bytes", { key, kind, status: 201, bytes: incoming.size });
     if (!await upsertObject(env, { key, kind, etag: object.httpEtag, sha256: incoming.sha256, size: incoming.size })) {
@@ -144,16 +151,14 @@ export async function putImmutableObject(
 }
 
 export async function getObjectResponse(env: Bindings, request: Request, key: string, kind: ObjectKind): Promise<Response> {
-  const downloadTtl = directDownloadTtl(env);
   // R2 presigned URLs preserve R2's native status, range, and validator
   // handling. A HEAD+Range request is the one binding fallback needed by Nix
   // clients that require an exact Content-Range response before downloading.
-  if (!(request.method === "HEAD" && request.headers.has("Range"))) {
-    const presigned = await createPresignedRead(env, key, request.method as "GET" | "HEAD", downloadTtl);
-    emitMetric("r2_get", { key, kind, method: request.method, operation: "presigned_redirect", status: 307, bytes: 0 });
-    return new Response(null, { status: 307, headers: { "Cache-Control": "no-store", Location: presigned.url } });
-  }
-  return getBindingObjectResponse(env, request, key, kind);
+  if (request.method === "HEAD" && request.headers.has("Range")) return getBindingObjectResponse(env, request, key, kind);
+  const downloadTtl = directDownloadTtl(env);
+  const presigned = await createPresignedRead(env, key, request.method as "GET" | "HEAD", downloadTtl);
+  emitMetric("r2_get", { key, kind, method: request.method, operation: "presigned_redirect", status: 307, bytes: 0 });
+  return new Response(null, { status: 307, headers: { "Cache-Control": "no-store", Location: presigned.url } });
 }
 
 async function getBindingObjectResponse(env: Bindings, request: Request, key: string, kind: ObjectKind): Promise<Response> {
