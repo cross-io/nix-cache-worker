@@ -60,7 +60,7 @@ async function duplicateResult(
   existing: R2Object,
   indexed: Awaited<ReturnType<typeof getObject>>,
 ): Promise<UploadResult> {
-  if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  if (indexed?.state === "deleting" || indexed?.state === "orphaned") throw new AppError("object_deleting", "The object is currently being deleted", 409);
   const existingSha256 = await digestExisting(env, key, kind, existing, indexed);
   if (incoming.sha256 !== existingSha256 || incoming.size !== existing.size) {
     throw new AppError("immutable_conflict", "An object with this key already exists with different content", 409);
@@ -75,11 +75,23 @@ async function duplicateResult(
 }
 
 export async function discardUnindexedObject(env: Bindings, key: string, kind: ObjectKind, etag: string): Promise<void> {
-  const current = await env.CACHE_BUCKET.head(key);
-  emitMetric("r2_get", { key, kind, operation: "head", status: current ? 200 : 404, bytes: 0, cleanup: "unindexed" });
-  // A conditional PUT may have raced with deletion. Only remove the object
-  // created by this request; never delete a newer object that reused the key.
-  if (current?.httpEtag === etag) await env.CACHE_BUCKET.delete(key);
+  // Claim the deleting row before touching R2. The orphaned state prevents a
+  // concurrent writer from repairing or reusing the key between HEAD and
+  // DELETE, while an already-issued direct PUT can still fail harmlessly on
+  // If-None-Match: *.
+  const claim = await env.DB.prepare(
+    "UPDATE objects SET state = 'orphaned' WHERE r2_key = ? AND state = 'deleting'",
+  ).bind(key).run();
+  if (claim.meta.changes !== 1) return;
+  try {
+    const current = await env.CACHE_BUCKET.head(key);
+    emitMetric("r2_get", { key, kind, operation: "head", status: current ? 200 : 404, bytes: 0, cleanup: "unindexed" });
+    // Only remove the object created by this request; never delete a newer
+    // direct-upload object that appeared after the deletion claim.
+    if (current?.httpEtag === etag) await env.CACHE_BUCKET.delete(key);
+  } finally {
+    await env.DB.prepare("DELETE FROM objects WHERE r2_key = ? AND state = 'orphaned'").bind(key).run();
+  }
 }
 
 /**
@@ -96,7 +108,7 @@ export async function putImmutableObject(
 ): Promise<UploadResult> {
   const indexed = await getObject(env, key);
   if (indexed && indexed.kind !== kind) throw new AppError("immutable_conflict", "An object with this key already exists with a different kind", 409);
-  if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  if (indexed?.state === "deleting" || indexed?.state === "orphaned") throw new AppError("object_deleting", "The object is currently being deleted", 409);
   if (indexed?.state === "pending" && !options.allowPending) {
     throw new AppError("object_uploading", "The object is currently being uploaded", 409);
   }

@@ -30,7 +30,7 @@ export function validateDirectUploadInput(body: unknown): DirectUploadInput {
 async function inspectDirectUploadTarget(env: Bindings, input: DirectUploadInput): Promise<{ indexed: Awaited<ReturnType<typeof getObject>>; alreadyExists: boolean; needsCompletion: boolean }> {
   const indexed = await getObject(env, input.key);
   if (indexed && indexed.kind !== "nar") throw new AppError("immutable_conflict", "An object with this key already exists with a different kind", 409);
-  if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  if (indexed?.state === "deleting" || indexed?.state === "orphaned") throw new AppError("object_deleting", "The object is currently being deleted", 409);
 
   const existing = await env.CACHE_BUCKET.head(input.key);
   emitMetric("r2_get", { key: input.key, kind: "nar", operation: "head", status: existing ? 200 : 404, bytes: 0, directUpload: true });
@@ -74,7 +74,7 @@ export async function completeDirectUpload(env: Bindings, input: DirectUploadInp
   emitMetric("r2_get", { key: input.key, kind: "nar", operation: "head", status: object ? 200 : 404, bytes: 0, directUpload: true });
   if (!object) throw new AppError("upload_not_found", "The final R2 object was not found", 424);
   const indexed = await getObject(env, input.key);
-  if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  if (indexed?.state === "deleting" || indexed?.state === "orphaned") throw new AppError("object_deleting", "The object is currently being deleted", 409);
   if (indexed && indexed.kind !== "nar") throw new AppError("immutable_conflict", "An object with this key already exists with a different kind", 409);
   if (indexed?.state === "ready" && (indexed.sha256 !== input.sha256 || indexed.size !== input.size)) {
     throw new AppError("immutable_conflict", "An object with this key already exists with different content", 409);

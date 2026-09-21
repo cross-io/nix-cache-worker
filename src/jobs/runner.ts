@@ -254,7 +254,13 @@ async function processDeleteObjects(env: Bindings, jobId: string): Promise<boole
     "SELECT object_key, object_kind FROM job_object_items WHERE job_id = ? ORDER BY object_kind, object_key LIMIT ?",
   ).bind(jobId, OBJECT_PAGE_SIZE).all<JobObjectRow>();
   if (!rows.results.length) return true;
-  for (const item of rows.results) {
+  let lastHeartbeat = Date.now();
+  for (let index = 0; index < rows.results.length; index += 1) {
+    const item = rows.results[index];
+    if (Date.now() - lastHeartbeat >= 60_000) {
+      await touchJob(env, jobId);
+      lastHeartbeat = Date.now();
+    }
     const marked = await markObjectDeleting(env, item);
     if (marked) {
       await env.CACHE_BUCKET.delete(item.object_key);
@@ -265,6 +271,7 @@ async function processDeleteObjects(env: Bindings, jobId: string): Promise<boole
     await env.DB.prepare("DELETE FROM job_object_items WHERE job_id = ? AND object_key = ? AND object_kind = ?")
       .bind(jobId, item.object_key, item.object_kind).run();
   }
+  await touchJob(env, jobId);
   return rows.results.length < OBJECT_PAGE_SIZE;
 }
 
