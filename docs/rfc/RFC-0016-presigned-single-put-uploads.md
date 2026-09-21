@@ -1,13 +1,13 @@
 # RFC-0016: presigned single-PUT uploads for large NARs
 
-- Status: Superseded by RFC-0021
+- Status: Superseded by RFC-0022
 - Date: 2026-09-19
 
 ## Context
 
-RFC-0021 replaces this session-and-staging design with stateless final-key
-conditional uploads. This RFC remains as historical context only; its endpoint,
-schema, cleanup, and migration instructions are no longer operational.
+RFC-0022 restores this session-and-staging design for NAR uploads. This RFC
+remains as historical context only; its endpoint, schema, cleanup, and
+migration instructions are no longer operational.
 
 The standard Nix HTTP cache protocol sends each cache object in one HTTP PUT.
 Cloudflare Workers request-body limits therefore prevent the Worker from

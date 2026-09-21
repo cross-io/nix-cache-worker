@@ -59,3 +59,4 @@ The RFCs currently recorded are:
 - [RFC-0019: direct large-NAR publishing and removal of Worker multipart](RFC-0019-direct-large-nar-publishing.md)
 - [RFC-0020: zero-compile Nix upload client](RFC-0020-zero-compile-nix-upload-client.md)
 - [RFC-0021: best-effort read cache rebuild](RFC-0021-best-effort-read-cache-rebuild.md)
+- [RFC-0022: staging direct uploads without tombstones](RFC-0022-staging-direct-uploads-without-tombstones.md)

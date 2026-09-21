@@ -61,18 +61,15 @@ a Markdown-only push does not trigger it; a push that includes code and
 Markdown still runs the test. A concurrency group cancels an older in-flight
 test deployment before a newer push can reconfigure the shared Worker.
 
-The test makes two Nix store entries and exercises both publisher interfaces:
+The test makes two Nix store entries and exercises the direct publisher plus the
+authenticated narinfo and read paths:
 
-1. An 8 MiB random payload is added to the real Nix store. `nix copy --to`
-   uploads it through the normal HTTP cache protocol, and `nix store cat --store`
-   retrieves the target file from the deployed Worker and verifies its SHA-256.
-2. A 128 MiB random payload is added to the real Nix store. The checked-in
-   `bin/nix-cache-upload` client receives both paths in one invocation. It
-   creates its own local file cache, confirms one generated NAR is over 100 MiB,
-   uploads NARs through `POST /api/uploads` and presigned R2 PUTs, publishes the
-   Nix-generated narinfos through normal authenticated PUTs, and registers the
-   temporary version. `nix store cat --store` downloads and verifies the large
-   target file from the Worker.
+1. An 8 MiB and a 128 MiB random payload are added to the real Nix store. The
+   checked-in `bin/nix-cache-upload` client receives both paths in one
+   invocation, uploads every NAR through staging direct upload and completion,
+   publishes the Nix-generated narinfos through authenticated PUTs, and
+   registers the temporary version. `nix store cat --store` downloads and
+   verifies both target files from the Worker.
 
 The script first confirms that an anonymous cache request is rejected. It then
 uses a mode-0600 read netrc for both Nix readbacks, and gives real `nix store
@@ -80,11 +77,10 @@ cat` a separate mode-0600 netrc with an intentionally invalid token that must
 fail. This proves Nix sends its Basic credential and that the configured read
 secret is usable.
 
-The client-managed large case intentionally uses the direct-upload protocol:
-stock `nix copy --to` cannot discover or use this API, and routing its 100+ MiB
-request through the Worker would not validate the purpose of the feature. The testing
-configuration also enables five-minute presigned R2 read redirects, so both
-Nix readback checks verify that Nix follows the direct data-plane URL. The
+All NAR publishing intentionally uses the direct-upload protocol: stock `nix
+copy --to` cannot discover the staging API and ordinary NAR PUT is rejected.
+The testing configuration also enables five-minute presigned R2 read redirects,
+so both Nix readback checks verify that Nix follows the direct data-plane URL. The
 large-object case also verifies the redirected R2 Range, `If-None-Match`, and
 `If-Match` responses before Nix reads the payload. It first asserts that both
 GET and HEAD return a signed `307` R2 URL without logging that bearer URL.
@@ -93,15 +89,15 @@ After both reads succeed, the client has registered its narinfos as a temporary
 test version and the script uses the admin deletion job to remove the version,
 narinfos, and unshared final NARs. Deletion is intentionally best effort for
 edge and client caches, while D1 reference counters strictly protect shared
-NARs. There are no staging objects or upload-session cleanup jobs in this
-architecture.
+NARs. Staging objects and upload sessions are retained until expiry and cleaned
+by bounded cron work.
 
 Before publishing, the script also materializes a local file cache and records
 the deterministic final NAR/narinfo keys. If a later command fails or GitHub
 Actions cancels the run, its EXIT trap uses the isolated deployment credential
 to perform best-effort cleanup of only those known, unreferenced final objects
-and their D1 rows. Any final-key object that was not indexed is explicitly
-removed by the cleanup path after the test has stopped using it.
+and their D1 rows. Any staging or final object that was not indexed is
+explicitly removed by the cleanup path after the test has stopped using it.
 The script deletes a D1 object row only after the matching R2 deletion succeeds;
 on a transient R2 failure it retains the index rather than creating an
 unrecoverable R2/D1 inconsistency.

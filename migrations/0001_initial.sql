@@ -13,14 +13,44 @@ CREATE TABLE objects (
   sha256 TEXT,
   size INTEGER NOT NULL CHECK (size >= 0),
   uploaded_at TEXT NOT NULL,
-  deleting_at TEXT,
-  state TEXT NOT NULL DEFAULT 'ready' CHECK (state IN ('pending', 'ready', 'orphaned', 'deleting', 'deleted')),
+  state TEXT NOT NULL DEFAULT 'ready' CHECK (state IN ('pending', 'ready', 'deleting')),
   narinfo_ref_count INTEGER NOT NULL DEFAULT 0 CHECK (narinfo_ref_count >= 0),
   version_member_count INTEGER NOT NULL DEFAULT 0 CHECK (version_member_count >= 0)
 );
 
 CREATE INDEX idx_objects_kind_uploaded ON objects(kind, uploaded_at);
 CREATE INDEX idx_objects_deletion ON objects(kind, state, narinfo_ref_count, version_member_count);
+
+CREATE TABLE write_claims (
+  r2_key TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_write_claims_expiry ON write_claims(expires_at);
+
+CREATE TABLE upload_sessions (
+  id TEXT PRIMARY KEY,
+  r2_key TEXT NOT NULL,
+  staging_key TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL CHECK (kind = 'nar'),
+  expected_size INTEGER NOT NULL CHECK (expected_size >= 0),
+  expected_sha256 TEXT NOT NULL CHECK (length(expected_sha256) = 64),
+  status TEXT NOT NULL DEFAULT 'issued'
+    CHECK (status IN ('issued', 'completed', 'failed', 'expired', 'revoked')),
+  object_etag TEXT,
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  completed_at TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_upload_sessions_expiry ON upload_sessions(status, expires_at);
+CREATE INDEX idx_upload_sessions_key ON upload_sessions(r2_key, status, created_at DESC);
+CREATE UNIQUE INDEX idx_upload_sessions_active_key
+  ON upload_sessions(r2_key)
+  WHERE status = 'issued';
 
 CREATE TABLE narinfo_refs (
   narinfo_key TEXT PRIMARY KEY REFERENCES objects(r2_key),

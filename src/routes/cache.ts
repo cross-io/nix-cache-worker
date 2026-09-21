@@ -3,7 +3,7 @@ import type { AppEnv } from "../env";
 import { AppError } from "../domain/errors";
 import { cacheControlFor, kindForKey, normalizeKeyFromUrl } from "../domain/keys";
 import { requireCacheRead, requireRole } from "../middleware/auth";
-import { getObjectResponse, putImmutableObject } from "../storage/r2";
+import { getObjectResponse } from "../storage/r2";
 import { handleNarinfoPut } from "./narinfo";
 import { emitWorkerCacheHit, matchWorkerCache, responseForRequestMethod, scheduleWorkerCachePut } from "../storage/worker-cache";
 
@@ -52,7 +52,5 @@ cacheRoutes.put("/*", requireRole("write"), async (c) => {
   const kind = kindForKey(key);
   if (kind === "cache-info") throw new AppError("method_not_allowed", "The cache information document is read-only", 405);
   if (kind === "narinfo") return handleNarinfoPut(c);
-  const result = await putImmutableObject(c.env, key, kind, c.req.raw);
-  if (result.duplicate) return new Response(null, { status: 204, headers: { ETag: result.object.httpEtag } });
-  return new Response(null, { status: 201, headers: { ETag: result.object.httpEtag, "Content-Length": "0" } });
+  throw new AppError("direct_upload_required", "NAR objects must be uploaded through the direct-upload API", 405);
 });

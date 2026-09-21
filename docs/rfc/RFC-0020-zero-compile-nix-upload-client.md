@@ -1,13 +1,13 @@
 # RFC-0020: zero-compile Nix upload client
 
-- Status: Superseded by RFC-0021
+- Status: Superseded by RFC-0022
 - Date: 2026-09-20
 
 ## Context
 
-RFC-0021 changes the direct-upload contract from sessions and staging keys to
-stateless final-key uploads. This RFC remains historical context only; the
-current client flow is documented in RFC-0021 and the operator documentation.
+RFC-0022 changes the direct-upload contract back to sessions and staging keys.
+This RFC remains historical context only; the current client flow is
+documented in RFC-0022 and the operator documentation.
 
 RFC-0016 provides a safe direct R2 upload session, but it requires a CI
 publisher to generate a NAR, calculate its digest, call multiple endpoints in

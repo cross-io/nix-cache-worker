@@ -21,18 +21,11 @@ The storage responsibilities are deliberately separated:
 - **D1** is the index and control plane for objects and package/version metadata.
 - **Worker Secrets** are the source of truth for bearer tokens.
 
-The cache is designed to work directly with `nix copy --to` and `nix copy --from`.
-
-NARs that exceed the Worker request-body limit use the separate authenticated
-direct-upload API. The client receives a presigned PUT for the final NAR key,
-writes once to that key, and calls completion with the key, size, and SHA-256.
-The Worker verifies the final bytes before indexing them in D1.
-
-`bin/nix-cache-upload` is the supported zero-compile CI wrapper for that flow.
-It exports a complete local file cache from one or more Nix installables, sends
-all of its NARs through final-key direct uploads, publishes narinfos only after
-completion, and registers an explicit package/version. Stock `nix copy --to`
-remains the compatibility publisher for ordinary Worker PUTs.
+`bin/nix-cache-upload` is the supported zero-compile CI publisher. It exports a
+complete local file cache, uploads every unique NAR to a random staging key,
+completes the session through the Worker, publishes narinfos, and registers an
+explicit package/version. Ordinary NAR PUT requests are intentionally rejected;
+this is a non-compatible full rebuild.
 
 ## Cache API
 
@@ -44,23 +37,26 @@ The cache uses the conventional Nix binary-cache paths.
 | `GET`, `HEAD` | `/<hash>.narinfo` | NAR metadata | Public read or read token |
 | `GET`, `HEAD` | `/nar/<path>` | NAR payload | Public read or read token |
 | `PUT` | `/<hash>.narinfo` | Upload NAR metadata | Write or admin token |
-| `PUT` | `/nar/<path>` | Upload NAR payload | Write or admin token |
+| `PUT` | `/nar/<path>` | Rejected; use the direct-upload API | Write or admin token |
 
-Large-NAR control-plane endpoints:
+Direct NAR upload control-plane endpoints:
 
 | Method | Path | Purpose | Auth |
 | --- | --- | --- | --- |
-| `POST` | `/api/uploads` | Issue a final-key presigned NAR PUT | Write or admin token |
-| `POST` | `/api/uploads/complete` | Verify and index the final NAR | Write or admin token |
+| `POST` | `/api/uploads` | Create a staging NAR upload session | Write or admin token |
+| `POST` | `/api/uploads/<uploadId>/complete` | Verify staging and promote the NAR | Write or admin token |
 
-`POST /api/uploads` accepts `{ "key", "size", "sha256" }` and returns a
-presigned PUT for the final key plus `uploadHeaders` and `alreadyExists`.
-After the direct PUT, call `/api/uploads/complete` with the same JSON body.
-Completion performs R2 `HEAD` and `GET` verification and repairs the D1 index.
-A wrong final object is retained because a stateless completion call cannot
-prove it owns the bytes; an operator can remove that unindexed immutable key.
-There are no upload IDs, staging keys, or
-session cleanup jobs.
+There is no Worker NAR upload endpoint. `PUT /nar/*` returns
+`405 direct_upload_required`; only `.narinfo` metadata is written with a
+Worker `PUT`.
+
+`POST /api/uploads` accepts `{ "key", "size", "sha256" }` and returns an
+`uploadId` plus a presigned PUT for `_nix_uploads/<uploadId>`. After the
+staging PUT, call `/api/uploads/<uploadId>/complete`. Completion verifies the
+staging object, conditionally promotes it to the final key, and indexes it in
+D1. Wrong staging content is never promoted. Sessions and staging objects are
+cleaned after expiry; deleting a final object removes its D1 row after R2
+deletion, with no tombstone.
 
 ### HTTP behavior
 
@@ -72,9 +68,8 @@ session cleanup jobs.
 - Missing objects return `404 Not Found`.
 - Malformed narinfo returns `422 Unprocessable Content`; a narinfo whose NAR dependency is missing returns `424 Failed Dependency`.
 - Cache objects are immutable. A repeated PUT with identical bytes is an idempotent success; a PUT with different bytes never overwrites the existing object and returns a conflict response.
-- Normal Worker PUTs stream directly into one R2 single write. NARs larger
-  than the Worker request-body limit use the direct single-PUT API; the R2
-  presigned URL is not a multipart or resumable protocol.
+- NAR payloads never enter the Worker upload path. Narinfo PUTs remain
+  Worker-managed so reference counters can be updated atomically.
 - Cache object GET and HEAD requests redirect to a presigned R2 URL without a
   D1 lookup or R2 `HEAD`; the redirect is `no-store`. Worker Cache is retained
   only for the generated `/nix-cache-info` response. A `HEAD` request with a
@@ -135,8 +130,9 @@ only over HTTPS:
 machine nix-cache.example.com login nix password <write-token>
 ```
 
-Bearer authentication remains the canonical API format. The Basic form exists
-only because `nix copy --to` does not provide a custom Bearer header option.
+Bearer authentication remains the canonical API format. The Basic form remains
+useful for Nix clients that read from a token-protected cache and do not provide
+a custom Bearer header option.
 
 The three tokens have separate roles:
 
@@ -404,7 +400,7 @@ The local test suite uses the Workers Vitest pool with local D1/R2 simulators.
 
 The v1 implementation is complete when it can demonstrate:
 
-- Real `nix copy --to` and `nix copy --from` operation.
+- Real staging direct NAR publishing with `bin/nix-cache-upload` and Nix readback.
 - GET, HEAD, Range, ETag, and conditional request behavior.
 - The complete anonymous/read/write/admin permission matrix.
 - Idempotent same-content PUT and conflict on different-content PUT.

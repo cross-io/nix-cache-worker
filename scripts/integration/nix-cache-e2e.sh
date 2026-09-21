@@ -201,27 +201,6 @@ done < <(find "$expected_file_cache" -maxdepth 1 -type f -name '*.narinfo' -prin
 sort -u "$cleanup_keys_file" > "$cleanup_keys_file.sorted"
 mv "$cleanup_keys_file.sorted" "$cleanup_keys_file"
 
-printf 'Uploading the sub-50 MiB NAR with nix copy...\n'
-nix --option netrc-file "$netrc_file" copy --to "$base_url" "$small_store_path"
-
-small_narinfo_key="$(basename "$small_store_path").narinfo"
-small_nar_key="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/$small_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
-if [[ -z "$small_nar_key" ]]; then
-  printf 'The small Nix upload did not publish a usable narinfo\n' >&2
-  exit 1
-fi
-small_nar_size="$(retry_cache_request --head --netrc-file "$read_netrc_file" "$base_url/$small_nar_key" | awk 'BEGIN { IGNORECASE = 1 } /^content-length:/ { print $2 }' | tr -d '\r' | tail -n 1)"
-if [[ -z "$small_nar_size" || "$small_nar_size" -ge $((50 * 1024 * 1024)) ]]; then
-  printf 'The small NAR did not stay below 50 MiB\n' >&2
-  exit 1
-fi
-
-small_downloaded_sha256="$(retry_nix_store_cat_sha256 "$small_store_path" "$read_netrc_file")"
-if [[ "$small_downloaded_sha256" != "$small_expected_sha256" ]]; then
-  printf 'Nix did not retrieve the expected small payload\n' >&2
-  exit 1
-fi
-
 client_output="$temporary_directory/nix-cache-upload.log"
 printf 'Publishing the small and over-100 MiB paths with nix-cache-upload...\n'
 NIX_CACHE_WRITE_TOKEN="$NIX_CACHE_TESTING_WRITE_TOKEN" \
@@ -235,6 +214,23 @@ NIX_CACHE_WRITE_TOKEN="$NIX_CACHE_TESTING_WRITE_TOKEN" \
 largest_client_nar_size="$(awk -F'[()]' '/^Preparing direct upload for / { value = $2; sub(/ bytes$/, "", value); if (value > largest) largest = value } END { print largest + 0 }' "$client_output")"
 if [[ "$largest_client_nar_size" -le $((100 * 1024 * 1024)) ]]; then
   printf 'nix-cache-upload did not produce an over-100 MiB direct NAR\n' >&2
+  exit 1
+fi
+
+small_narinfo_key="$(basename "$small_store_path").narinfo"
+small_nar_key="$(retry_cache_request --netrc-file "$read_netrc_file" "$base_url/$small_narinfo_key" | awk '$1 == "URL:" { print $2; exit }')"
+if [[ -z "$small_nar_key" ]]; then
+  printf 'The direct small NAR upload did not publish a usable narinfo\n' >&2
+  exit 1
+fi
+small_nar_size="$(retry_cache_request --head --netrc-file "$read_netrc_file" "$base_url/$small_nar_key" | awk 'BEGIN { IGNORECASE = 1 } /^content-length:/ { print $2 }' | tr -d '\r' | tail -n 1)"
+if [[ -z "$small_nar_size" || "$small_nar_size" -ge $((50 * 1024 * 1024)) ]]; then
+  printf 'The small NAR did not stay below 50 MiB\n' >&2
+  exit 1
+fi
+small_downloaded_sha256="$(retry_nix_store_cat_sha256 "$small_store_path" "$read_netrc_file")"
+if [[ "$small_downloaded_sha256" != "$small_expected_sha256" ]]; then
+  printf 'Nix did not retrieve the expected small payload\n' >&2
   exit 1
 fi
 

@@ -1,6 +1,6 @@
 # RFC-0021: best-effort read cache rebuild
 
-- Status: Implemented
+- Status: Superseded
 - Date: 2026-09-21
 
 ## Context
@@ -119,10 +119,6 @@ API endpoint is migrated.
 
 ## Implementation notes
 
-The implementation removes worker cache generation, dynamic read TTL, write
-claims, staging upload sessions, and per-upload audit rows. Management changes
-continue to use the audit log; upload details are emitted through structured
-Worker logs. The implementation also squashes the schema to one migration,
-updates the bundled CI client and integration cleanup path, and validates the
-new read, upload, reference-protection, and job behavior in the local test
-suite. No intentional deviations from this RFC remain.
+The read-plane portions of this RFC remain implemented. RFC-0022 supersedes
+the final-key upload and permanent-tombstone portions by restoring random
+staging sessions and removing the deleted-object state.

@@ -54,8 +54,9 @@ npx wrangler d1 migrations apply <D1_DATABASE_NAME> --remote
 
 The migration creates object indexes, reference counters, package/version
 membership, policies, persistent jobs, combined `job_object_items`, GC
-snapshots, and audit records. It does not create `settings`, `write_claims`,
-`upload_sessions`, or the old split deletion tables.
+snapshots, audit records, short-lived `write_claims`, and staging
+`upload_sessions`. It does not create `settings`, the old split deletion
+tables, or any tombstone table.
 
 ## 4. Configure secrets and deploy
 
@@ -120,7 +121,7 @@ deployment values are changed in Wrangler and require redeployment.
 
 ## 8. Direct upload operation
 
-The direct flow is stateless and uses the final key:
+The direct flow uses a random staging key and a persistent upload session:
 
 ```bash
 curl --fail-with-body -X POST https://cache.example.org/api/uploads \
@@ -128,20 +129,17 @@ curl --fail-with-body -X POST https://cache.example.org/api/uploads \
   -H 'Content-Type: application/json' \
   -d '{"key":"nar/example.nar","size":123,"sha256":"<sha256>"}'
 
-curl --fail-with-body -X POST https://cache.example.org/api/uploads/complete \
-  -H "Authorization: Bearer $WRITE_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"key":"nar/example.nar","size":123,"sha256":"<sha256>"}'
+curl --fail-with-body -X POST https://cache.example.org/api/uploads/<uploadId>/complete \
+  -H "Authorization: Bearer $WRITE_TOKEN"
 ```
 
-The first response supplies the presigned PUT URL and required headers. PUT the
-file to that URL before calling completion. A wrong digest or size is retained
-because a stateless completion request cannot prove it owns the final bytes;
-remove the resulting unindexed immutable key manually if necessary. There are
-no staging sessions to expire or clean up. Version deletion leaves a D1
-tombstone and waits for the maximum seven-day direct-upload URL lifetime before
-removing the R2 object, preventing an already-issued presigned PUT from
-resurrecting it.
+The first response supplies an `uploadId`, staging presigned PUT URL, and
+required headers. PUT the file to that random `_nix_uploads/<uploadId>` key
+before calling its completion endpoint. A wrong digest never promotes a final
+object. Completed, failed, expired, and revoked staging sessions are cleaned
+after expiry. Version deletion revokes issued sessions, deletes R2, and then
+removes the D1 object row; no tombstone is retained, so the final key can be
+reused.
 
 ## Operations and recovery
 

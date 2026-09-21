@@ -8,7 +8,7 @@ that build packages and publish them to a private, policy-managed cache.
 
 It supports:
 
-- standard `nix copy --to` and `nix copy --from` workflows;
+- standard Nix cache reads and authenticated narinfo publishing; NAR payloads use the direct-upload client;
 - optional anonymous or read-token-protected cache reads with authenticated writes;
 - a zero-compile Nix publishing client with direct-to-R2 NAR uploads;
 - low-cost R2 Custom Domain reads or presigned R2 redirects through the Worker;
@@ -56,10 +56,11 @@ The admin console is available at `/admin`. It manages package versions,
 retention rules, pins, garbage collection, and persistent deletion jobs.
 
 For CI publishing, use [`bin/nix-cache-upload`](bin/nix-cache-upload). It
-exports a standard local Nix file cache, sends every NAR directly to its final
-R2 key through an authenticated presigned URL, publishes narinfo only after completion,
-and registers the requested package/version. This does not change the standard
-`nix copy --to` protocol.
+exports a standard local Nix file cache, sends every NAR to a random staging
+R2 key through an authenticated presigned URL, asks the Worker to verify and
+promote it, publishes narinfo only after completion, and registers the requested
+package/version. NAR payloads are intentionally not accepted through ordinary
+`nix copy --to` PUT requests.
 
 ```bash
 NIX_CACHE_WRITE_TOKEN=... bin/nix-cache-upload \
@@ -78,7 +79,7 @@ Range, ETag, and conditional response. Redirects are `no-store`.
 NAR and narinfo objects use `public, max-age=31536000, immutable`. Deletion is
 best effort for CDN, browser, and presigned-URL caches, so stale content after
 deletion is accepted. See [`docs/architecture.md`](docs/architecture.md) and
-RFC-0021 for the full design.
+RFC-0022 for the full staging-upload design.
 
 ## Development
 

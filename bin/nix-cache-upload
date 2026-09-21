@@ -139,7 +139,7 @@ write_direct_curl_config() {
   local cache_control="$5"
   local nar_file="$6"
 
-  [[ "$upload_url" =~ ^https://[[:xdigit:]]{32}\.r2\.cloudflarestorage\.com/ ]] || die "direct upload returned an unexpected R2 URL"
+  [[ "$upload_url" =~ ^https://[[:xdigit:]]{32}\.r2\.cloudflarestorage\.com/.*/_nix_uploads/ ]] || die "direct upload returned an unexpected R2 staging URL"
   [[ "$content_type" == "application/octet-stream" ]] || die "direct upload returned an unexpected Content-Type"
   [[ "$if_none_match" == "*" ]] || die "direct upload returned an unexpected If-None-Match value"
   [[ "$cache_control" == "public, max-age=31536000, immutable" ]] || die "direct upload returned an unexpected Cache-Control value"
@@ -184,28 +184,20 @@ initialize_upload() {
 }
 
 complete_upload() {
-  local nar_key="$1"
-  local nar_size="$2"
-  local nar_sha256="$3"
+  local upload_id="$1"
+  local nar_key="$2"
   local response_file="$temporary_directory/upload-complete.json"
-  local request_file="$temporary_directory/upload-complete-request.json"
   local attempt status
 
-  jq --null-input --compact-output \
-    --arg key "$nar_key" \
-    --arg sha256 "$nar_sha256" \
-    --argjson size "$nar_size" \
-    '{key: $key, size: $size, sha256: $sha256}' > "$request_file"
-
   for ((attempt = 0; attempt <= retry_count; attempt++)); do
-    status="$(api_request POST "$cache_url/api/uploads/complete" "$response_file" "$request_file")"
+    status="$(api_request POST "$cache_url/api/uploads/$upload_id/complete" "$response_file")"
     if [[ "$status" == "200" || "$status" == "201" ]]; then
       return 0
     fi
     if [[ "$attempt" -lt "$retry_count" ]]; then
       if retryable_status "$status" || {
         [[ "$status" == "409" || "$status" == "424" ]] && jq --exit-status --raw-output \
-          '(.error.code // "") == "upload_not_found" or (.error.code // "") == "upload_in_progress"' \
+          '(.error.code // "") == "upload_not_found" or (.error.code // "") == "upload_in_progress" or (.error.code // "") == "upload_not_ready"' \
           "$response_file" >/dev/null 2>&1
       }; then
         retry_delay "$attempt"
@@ -219,7 +211,7 @@ complete_upload() {
 upload_nar() {
   local nar_key="$1"
   local nar_file="$2"
-  local nar_size nar_sha256 session already_exists needs_completion upload_url content_type if_none_match cache_control
+  local nar_size nar_sha256 session already_exists upload_id upload_url content_type if_none_match cache_control
   local direct_config response_file attempt status
 
   nar_size="$(wc -c < "$nar_file" | tr -d '[:space:]')"
@@ -236,13 +228,7 @@ upload_nar() {
     return 0
   fi
 
-  needs_completion="$(jq --raw-output 'if .needsCompletion == true then "true" else "false" end' <<< "$session")" || die "direct upload response was not valid JSON"
-  if [[ "$needs_completion" == "true" ]]; then
-    complete_upload "$nar_key" "$nar_size" "$nar_sha256"
-    printf 'NAR completed: %s\n' "$nar_key"
-    return 0
-  fi
-
+  upload_id="$(jq --exit-status --raw-output '.uploadId // empty' <<< "$session")" || die "direct upload response did not contain uploadId"
   upload_url="$(jq --exit-status --raw-output '.uploadUrl // empty' <<< "$session")" || die "direct upload response did not contain uploadUrl"
   content_type="$(jq --exit-status --raw-output '.uploadHeaders["Content-Type"] // empty' <<< "$session")" || die "direct upload response did not contain Content-Type"
   if_none_match="$(jq --exit-status --raw-output '.uploadHeaders["If-None-Match"] // empty' <<< "$session")" || die "direct upload response did not contain If-None-Match"
@@ -255,7 +241,7 @@ upload_nar() {
   for ((attempt = 0; attempt <= retry_count; attempt++)); do
     status="$(curl_status "$response_file" --config "$direct_config")"
     if [[ "$status" =~ ^2[0-9][0-9]$ || "$status" == "412" ]]; then
-      complete_upload "$nar_key" "$nar_size" "$nar_sha256"
+      complete_upload "$upload_id" "$nar_key"
       printf 'NAR completed: %s\n' "$nar_key"
       return 0
     fi

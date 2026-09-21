@@ -39,7 +39,7 @@ They are stored with:
 Cache-Control: public, max-age=31536000, immutable
 ```
 
-The same metadata is used by direct final-key NAR uploads. The R2 Custom Domain
+The same metadata is used by promoted staging NAR uploads. The R2 Custom Domain
 should use a Cache Rule covering `/nix-cache-info`, `/*.narinfo`, and `/nar/*`
 with a long edge TTL and cached 404s. `/nix-cache-info` uses a short five-minute
 client cache lifetime because deployment variables can change; the edge rule
@@ -55,25 +55,28 @@ uses a new key without reintroducing a D1 generation lookup.
 
 ## Uploads
 
-Normal Nix PUTs stream one conditional write to the final key and then upsert
-the D1 object index. A same-content replay is idempotent; different content is
-an immutable conflict. A narinfo PUT first verifies that its referenced NAR is
-ready in both R2 and D1, then atomically creates `narinfo_refs` and increments
-the NAR's `narinfo_ref_count`.
+NAR payloads use the stateful direct-upload flow:
 
-Large NARs use a stateless final-key flow:
+1. `POST /api/uploads` validates the final key, size, and SHA-256, creates an
+   `upload_sessions` row, and returns an `uploadId` plus a presigned PUT for
+   `_nix_uploads/<uploadId>`.
+2. CI uploads the bytes directly to that random staging key with
+   `If-None-Match: *`.
+3. `POST /api/uploads/<uploadId>/complete` reads and hashes the staging object,
+   checks the final key, then conditionally streams the staging bytes to the
+   immutable final NAR key and indexes it in D1.
+4. Completed, failed, expired, and revoked sessions retain their staging object
+   until the session expiry and are then cleaned up by bounded cron work.
 
-1. `POST /api/uploads` validates key, size, and SHA-256 and returns a
-   presigned PUT for the final `nar/<...>` key.
-2. CI sends one PUT with `If-None-Match: *` and the returned headers.
-3. `POST /api/uploads/complete` performs R2 `HEAD`, streams R2 `GET` to hash
-   the object, and upserts `objects` after verification.
+Staging keys are never exposed by cache reads and never appear in `objects`.
+A same-content completion retry is idempotent; different final content is an
+immutable conflict. A wrong staging digest never creates a final object.
+Final-key key reuse is allowed after the R2 object and D1 row have been removed.
 
-There are no staging keys, upload sessions, staging cleanup jobs, or
-`_nix_uploads/` objects in the new deployment. A wrong digest or size leaves
-the final object untouched because completion cannot prove ownership of bytes
-written through a valid presigned URL; operators can remove that unindexed key.
-Direct uploads are limited to R2's 5 GiB single-PUT maximum.
+NAR `PUT /nar/*` is deliberately rejected with `405 direct_upload_required`.
+Narinfo PUT remains a Worker operation because it must parse the referenced NAR
+and atomically maintain `narinfo_refs` and `narinfo_ref_count`.
+The bundled `bin/nix-cache-upload` client is the supported publisher.
 
 ## D1 lifecycle model
 
@@ -83,12 +86,12 @@ audit metadata. `objects` stores both `narinfo_ref_count` and
 `version_member_count`, so GC does not need a per-object `COUNT(*)` scan.
 
 Membership changes and counter changes use the same D1 batch. A NAR can enter
-the deletion state only while it is ready and `narinfo_ref_count = 0`. Deletion
-first records a D1 deletion fence and waits for the maximum permitted
-presigned-upload lifetime (seven days) before deleting R2, so a presigned PUT
-issued before deletion cannot resurrect the key. R2 deletion and final
-tombstone update are independent retryable job steps. If a job is interrupted
-after a D1 state transition or an R2 delete, retrying is safe.
+the deletion state only while it is ready and `narinfo_ref_count = 0`. The
+deletion job obtains the same short-lived write claim used by upload completion,
+revokes issued upload sessions for the key, deletes R2, and then deletes the D1
+object row. There is no tombstone and the final key may be reused after
+cleanup. If a job is interrupted, the deleting row and job item remain
+retryable.
 
 Versions are identified by `(package_name, version_name)`; names are opaque.
 Retention and pinning are used only by GC and never affect HTTP response TTLs.

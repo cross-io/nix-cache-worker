@@ -6,6 +6,10 @@ import { emitMetric } from "../observability";
 import { getObject, upsertObject } from "./db";
 import { createPresignedRead, directDownloadTtl } from "./presign";
 
+const WRITE_CLAIM_TTL_MS = 15 * 60_000;
+const WRITE_CLAIM_CLEANUP_INTERVAL_MS = 60_000;
+let lastWriteClaimCleanupAt = 0;
+
 export type UploadResult = {
   object: R2Object;
   duplicate: boolean;
@@ -29,18 +33,84 @@ function strongEtagMatches(header: string | null, etag: string): boolean {
   return header.split(",").map((part) => part.trim()).some((part) => part === "*" || part === etag);
 }
 
+export async function claimObjectWrite(env: Bindings, key: string): Promise<string | null> {
+  const owner = crypto.randomUUID();
+  const currentTime = Date.now();
+  const currentTimestamp = new Date(currentTime).toISOString();
+  const expiresAt = new Date(currentTime + WRITE_CLAIM_TTL_MS).toISOString();
+  if (currentTime - lastWriteClaimCleanupAt >= WRITE_CLAIM_CLEANUP_INTERVAL_MS) {
+    lastWriteClaimCleanupAt = currentTime;
+    await env.DB.prepare("DELETE FROM write_claims WHERE expires_at < ?").bind(currentTimestamp).run();
+  }
+  const result = await env.DB.prepare(
+    `INSERT INTO write_claims (r2_key, owner, expires_at) VALUES (?, ?, ?)
+     ON CONFLICT(r2_key) DO UPDATE SET owner = excluded.owner, expires_at = excluded.expires_at
+     WHERE write_claims.expires_at < ?`,
+  ).bind(key, owner, expiresAt, currentTimestamp).run();
+  return result.meta.changes === 1 ? owner : null;
+}
+
+export async function renewObjectWrite(env: Bindings, key: string, owner: string): Promise<void> {
+  const expiresAt = new Date(Date.now() + WRITE_CLAIM_TTL_MS).toISOString();
+  const result = await env.DB.prepare("UPDATE write_claims SET expires_at = ? WHERE r2_key = ? AND owner = ?")
+    .bind(expiresAt, key, owner).run();
+  if (result.meta.changes === 0) throw new AppError("upload_claim_lost", "The upload claim expired or was lost", 409);
+}
+
+export async function releaseObjectWrite(env: Bindings, key: string, owner: string): Promise<void> {
+  await env.DB.prepare("DELETE FROM write_claims WHERE r2_key = ? AND owner = ?").bind(key, owner).run();
+}
+
+export function streamWithWriteClaim(
+  env: Bindings,
+  key: string,
+  owner: string,
+  body: ReadableStream<Uint8Array>,
+  length?: number,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  let lastRenewedAt = Date.now();
+  const renewing = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (Date.now() - lastRenewedAt >= WRITE_CLAIM_TTL_MS / 3) {
+          await renewObjectWrite(env, key, owner);
+          lastRenewedAt = Date.now();
+        }
+        if (result.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(result.value);
+      } catch (error) {
+        await reader.cancel(error).catch(() => undefined);
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  if (length === undefined) return renewing;
+  const fixed = new FixedLengthStream(length);
+  void renewing.pipeTo(fixed.writable).catch(() => undefined);
+  return fixed.readable;
+}
+
 async function digestExisting(
   env: Bindings,
   key: string,
   kind: ObjectKind,
   existing: R2Object,
   indexed: Awaited<ReturnType<typeof getObject>>,
+  owner?: string,
 ): Promise<string> {
   if (indexed?.sha256 && indexed.size === existing.size && indexed.state === "ready") return indexed.sha256;
   const body = await env.CACHE_BUCKET.get(key);
   emitMetric("r2_get", { key, kind, operation: "get", status: body ? 200 : 404, bytes: body?.size ?? 0, duplicateCheck: true });
   if (!body?.body) throw new AppError("orphaned_object", "The object exists in R2 but cannot be read for index repair", 503);
-  const digest = await hashStream(body.body);
+  const digest = await hashStream(owner ? streamWithWriteClaim(env, key, owner, body.body, existing.size) : body.body);
   // A pending narinfo row is a short-lived reference reservation. Do not
   // publish it while comparing a conflicting replay: its caller must be able
   // to roll the reservation back without leaving a live narinfo reference.
@@ -52,16 +122,17 @@ async function digestExisting(
   return digest.sha256;
 }
 
-async function duplicateResult(
+export async function duplicateDecisionByDigest(
   env: Bindings,
   key: string,
   kind: ObjectKind,
   incoming: { sha256: string; size: number },
   existing: R2Object,
   indexed: Awaited<ReturnType<typeof getObject>>,
+  owner?: string,
 ): Promise<UploadResult> {
-  if (indexed?.state === "deleting" || indexed?.state === "orphaned" || indexed?.state === "deleted") throw new AppError("object_deleting", "The object is currently being deleted", 409);
-  const existingSha256 = await digestExisting(env, key, kind, existing, indexed);
+  if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
+  const existingSha256 = await digestExisting(env, key, kind, existing, indexed, owner);
   if (incoming.sha256 !== existingSha256 || incoming.size !== existing.size) {
     throw new AppError("immutable_conflict", "An object with this key already exists with different content", 409);
   }
@@ -72,28 +143,6 @@ async function duplicateResult(
   }
   emitMetric("r2_put", { key, kind, status: 204, duplicate: true, bytes: 0 });
   return { object: existing, duplicate: true, sha256: incoming.sha256 };
-}
-
-export async function discardUnindexedObject(env: Bindings, key: string, kind: ObjectKind, etag: string): Promise<void> {
-  // Claim the deleting row before touching R2. The orphaned state prevents a
-  // concurrent writer from repairing or reusing the key between HEAD and
-  // DELETE, while an already-issued direct PUT can still fail harmlessly on
-  // If-None-Match: *.
-  const claim = await env.DB.prepare(
-    "UPDATE objects SET state = 'orphaned' WHERE r2_key = ? AND state = 'deleting'",
-  ).bind(key).run();
-  if (claim.meta.changes !== 1) return;
-  try {
-    const current = await env.CACHE_BUCKET.head(key);
-    emitMetric("r2_get", { key, kind, operation: "head", status: current ? 200 : 404, bytes: 0, cleanup: "unindexed" });
-    // Only remove the object created by this request; never delete a newer
-    // direct-upload object that appeared after the deletion claim.
-    if (current?.httpEtag === etag) await env.CACHE_BUCKET.delete(key);
-  } finally {
-    await env.DB.prepare(
-      "UPDATE objects SET state = 'deleted', deleting_at = NULL, uploaded_at = ? WHERE r2_key = ? AND state = 'orphaned'",
-    ).bind(new Date().toISOString(), key).run();
-  }
 }
 
 async function discardCreatedObject(env: Bindings, key: string, kind: ObjectKind, etag: string): Promise<void> {
@@ -117,60 +166,66 @@ export async function putImmutableObject(
   request: Request,
   options: { allowPending?: boolean } = {},
 ): Promise<UploadResult> {
-  const indexed = await getObject(env, key);
-  if (indexed && indexed.kind !== kind) throw new AppError("immutable_conflict", "An object with this key already exists with a different kind", 409);
-  if (indexed?.state === "deleting" || indexed?.state === "orphaned") throw new AppError("object_deleting", "The object is currently being deleted", 409);
-  if (indexed?.state === "pending" && !options.allowPending) {
-    throw new AppError("object_uploading", "The object is currently being uploaded", 409);
-  }
-
-  const ifMatch = request.headers.get("If-Match");
-  const ifNoneMatch = request.headers.get("If-None-Match");
-  if (ifMatch) {
-    const existing = await env.CACHE_BUCKET.head(key);
-    if (!existing || !strongEtagMatches(ifMatch, existing.httpEtag)) {
-      throw new AppError("precondition_failed", "If-Match does not match the existing object", 412);
+  const owner = await claimObjectWrite(env, key);
+  if (!owner) throw new AppError("upload_in_progress", "Another upload for this object is in progress", 409);
+  try {
+    const indexed = await getObject(env, key);
+    if (indexed && indexed.kind !== kind) throw new AppError("immutable_conflict", "An object with this key already exists with a different kind", 409);
+    if (indexed?.state === "deleting") throw new AppError("object_deleting", "The object is currently being deleted", 409);
+    if (indexed?.state === "pending" && !options.allowPending) {
+      throw new AppError("object_uploading", "The object is currently being uploaded", 409);
     }
+
+    const ifMatch = request.headers.get("If-Match");
+    const ifNoneMatch = request.headers.get("If-None-Match");
+    if (ifMatch) {
+      const existing = await env.CACHE_BUCKET.head(key);
+      if (!existing || !strongEtagMatches(ifMatch, existing.httpEtag)) {
+        throw new AppError("precondition_failed", "If-Match does not match the existing object", 412);
+      }
+      if (ifNoneMatch && etagMatches(ifNoneMatch, existing.httpEtag)) {
+        throw new AppError("precondition_failed", "If-None-Match matches the existing object", 412);
+      }
+      if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
+      const incoming = await hashStream(request.body);
+      return duplicateDecisionByDigest(env, key, kind, incoming, existing, indexed, owner);
+    }
+
+    if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
+    const [hashBody, uploadBody] = request.body.tee();
+    const hashPromise = hashStream(hashBody);
+    const onlyIf: R2Conditional = { etagDoesNotMatch: "*" };
+    const object = await env.CACHE_BUCKET.put(key, uploadBody, {
+      onlyIf,
+      httpMetadata: httpMetadataFor(kind),
+    });
+    const incoming = await hashPromise;
+    if (object) {
+      if (indexed?.state === "ready" && (
+        !indexed.sha256 || indexed.size !== incoming.size || indexed.sha256 !== incoming.sha256
+      )) {
+        await discardCreatedObject(env, key, kind, object.httpEtag);
+        throw new AppError("immutable_conflict", "The D1 index already contains different immutable content", 409);
+      }
+      emitMetric("r2_put", { key, kind, status: 201, duplicate: false, bytes: incoming.size });
+      emitMetric("upload_bytes", { key, kind, status: 201, bytes: incoming.size });
+      if (!await upsertObject(env, { key, kind, etag: object.httpEtag, sha256: incoming.sha256, size: incoming.size })) {
+        await env.CACHE_BUCKET.delete(key);
+        throw new AppError("object_deleting", "The object is currently being deleted", 409);
+      }
+      return { object, duplicate: false, sha256: incoming.sha256 };
+    }
+
+    const existing = await env.CACHE_BUCKET.head(key);
+    emitMetric("r2_get", { key, kind, operation: "head", status: existing ? 200 : 404, bytes: 0, duplicateCheck: true });
+    if (!existing) throw new AppError("upload_race", "The conditional upload failed without an observable object", 503);
     if (ifNoneMatch && etagMatches(ifNoneMatch, existing.httpEtag)) {
       throw new AppError("precondition_failed", "If-None-Match matches the existing object", 412);
     }
-    if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
-    const incoming = await hashStream(request.body);
-    return duplicateResult(env, key, kind, incoming, existing, indexed);
+    return duplicateDecisionByDigest(env, key, kind, incoming, existing, await getObject(env, key), owner);
+  } finally {
+    await releaseObjectWrite(env, key, owner);
   }
-
-  if (!request.body) throw new AppError("empty_body", "PUT requests must contain a body", 400);
-  const [hashBody, uploadBody] = request.body.tee();
-  const hashPromise = hashStream(hashBody);
-  const onlyIf: R2Conditional = { etagDoesNotMatch: "*" };
-  const object = await env.CACHE_BUCKET.put(key, uploadBody, {
-    onlyIf,
-    httpMetadata: httpMetadataFor(kind),
-  });
-  const incoming = await hashPromise;
-  if (object) {
-    if (indexed?.state === "ready" && (
-      !indexed.sha256 || indexed.size !== incoming.size || indexed.sha256 !== incoming.sha256
-    )) {
-      await discardCreatedObject(env, key, kind, object.httpEtag);
-      throw new AppError("immutable_conflict", "The D1 index already contains different immutable content", 409);
-    }
-    emitMetric("r2_put", { key, kind, status: 201, duplicate: false, bytes: incoming.size });
-    emitMetric("upload_bytes", { key, kind, status: 201, bytes: incoming.size });
-    if (!await upsertObject(env, { key, kind, etag: object.httpEtag, sha256: incoming.sha256, size: incoming.size })) {
-      await discardUnindexedObject(env, key, kind, object.httpEtag);
-      throw new AppError("object_deleting", "The object is currently being deleted", 409);
-    }
-    return { object, duplicate: false, sha256: incoming.sha256 };
-  }
-
-  const existing = await env.CACHE_BUCKET.head(key);
-  emitMetric("r2_get", { key, kind, operation: "head", status: existing ? 200 : 404, bytes: 0, duplicateCheck: true });
-  if (!existing) throw new AppError("upload_race", "The conditional upload failed without an observable object", 503);
-  if (ifNoneMatch && etagMatches(ifNoneMatch, existing.httpEtag)) {
-    throw new AppError("precondition_failed", "If-None-Match matches the existing object", 412);
-  }
-  return duplicateResult(env, key, kind, incoming, existing, await getObject(env, key));
 }
 
 export async function getObjectResponse(env: Bindings, request: Request, key: string, kind: ObjectKind): Promise<Response> {

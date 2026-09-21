@@ -89,23 +89,26 @@ npx wrangler r2 object put "$R2_BUCKET_NAME/nix-cache-info" \
   --cache-control 'public, max-age=300'
 ```
 
-## Standard publishing
+## Publishing
 
-Use the ordinary Nix protocol for normal-sized objects:
+NAR payloads must use the bundled staging direct-upload client:
 
-```text
-PUT /nar/<name>
-PUT /<hash>.narinfo
-PUT /api/packages/<package>/<version>
+```bash
+NIX_CACHE_WRITE_TOKEN=... bin/nix-cache-upload \
+  --to https://cache.example.org \
+  --package example --version ci-123 \
+  nixpkgs#hello
 ```
 
-NAR and narinfo bytes are immutable. A same-content retry succeeds
-idempotently; different content never overwrites the final key. A narinfo is
-accepted only after its referenced NAR is ready in R2 and indexed in D1.
+The client creates a local Nix file cache, uploads each unique NAR to a random
+`_nix_uploads/<uploadId>` staging key, calls
+`POST /api/uploads/<uploadId>/complete`, then publishes narinfo through the
+Worker and registers the version. Ordinary `PUT /nar/*` requests return
+`405 direct_upload_required`; there is no Worker NAR upload compatibility path.
 
-## Stateless direct NAR upload
+## Direct NAR upload API
 
-There is no upload ID or staging key. Request a final-key presigned URL:
+Request a staging presigned URL:
 
 ```http
 POST /api/uploads
@@ -115,29 +118,21 @@ Content-Type: application/json
 {"key":"nar/example.nar","size":123,"sha256":"<lowercase sha256>"}
 ```
 
-The response contains `key`, `size`, `sha256`, `uploadUrl`, `uploadHeaders`,
-and `alreadyExists`. If `alreadyExists` is false and `needsCompletion` is not
-true, PUT the exact bytes to the returned URL using the returned `Content-Type`
-and `If-None-Match: *` headers. A `needsCompletion: true` response means that a
-previous final-key PUT succeeded but was not indexed; skip PUT and call the
-completion endpoint to repair the index.
-Then verify and index it:
+The response contains `uploadId`, `expiresAt`, `uploadUrl`, and `uploadHeaders`.
+PUT the exact bytes to the returned random staging URL using the returned
+headers, then complete that session:
 
 ```http
-POST /api/uploads/complete
+POST /api/uploads/<uploadId>/complete
 Authorization: Bearer <WRITE_TOKEN>
-Content-Type: application/json
-
-{"key":"nar/example.nar","size":123,"sha256":"<lowercase sha256>"}
 ```
 
-Completion performs one R2 `HEAD` and one R2 `GET` to calculate SHA-256. A
-wrong size or digest leaves the final key untouched: a stateless completion
-request cannot prove it owns bytes that may have been written by another valid
-presigned PUT. The immutable key remains unavailable for completion with a
-different digest and can be cleaned up by an operator if needed. Completion is
-idempotent after successful verification. The bundled `bin/nix-cache-upload`
-client uses this flow and publishes narinfo only after completion.
+Completion verifies the staging size and SHA-256, conditionally promotes it to
+the final key, and upserts the D1 object index. A wrong staging digest never
+creates a final object. Completion is idempotent after successful promotion.
+Terminal sessions and staging objects are cleaned after expiry. Deleting a
+final object removes its D1 row after R2 deletion, so the key can be reused and
+no tombstone is retained.
 
 ## Lifecycle and retention
 
